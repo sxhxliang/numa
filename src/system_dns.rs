@@ -921,114 +921,83 @@ fn redirect_dns_with_interfaces(
 }
 
 #[cfg(windows)]
-fn apply_restore(plan: &RestorePlan) -> Result<String, String> {
-    match plan.servers.split_first() {
-        Some((primary, rest)) => {
-            apply_static(plan.family, &plan.name, plan.if_index, primary, rest)
+impl RestorePlan {
+    fn apply(&self) -> Result<String, String> {
+        let idx = self.if_index.to_string();
+        match self.servers.split_first() {
+            Some((primary, rest)) => self.apply_static(&idx, primary, rest),
+            None => self.apply_dhcp(&idx),
         }
-        None => apply_dhcp(plan.family, &plan.name, plan.if_index),
-    }
-}
-
-#[cfg(windows)]
-fn apply_static(
-    family: AddressFamily,
-    name: &str,
-    if_index: u32,
-    primary: &str,
-    secondaries: &[String],
-) -> Result<String, String> {
-    let idx = if_index.to_string();
-    // validate=no — we trust the backup; validation issues an outbound DNS
-    // probe that fails on UDP-restricted networks (#147) and aborts the set.
-    let status = run_netsh(
-        family,
-        &[
-            "set",
-            "dnsservers",
-            &idx,
-            "static",
-            primary,
-            "primary",
-            "validate=no",
-        ],
-    )
-    .map_err(|e| {
-        format!(
-            "failed to set {} DNS for \"{}\": {}",
-            family.label(),
-            name,
-            e
-        )
-    })?;
-    if !status.success() {
-        return Err(format!(
-            "netsh failed to set {} primary {} for \"{}\"",
-            family.label(),
-            primary,
-            name
-        ));
     }
 
-    for (i, server) in secondaries.iter().enumerate() {
-        let idx_arg = format!("index={}", i + 2);
-        let status = run_netsh(
-            family,
-            &["add", "dnsservers", &idx, server, &idx_arg, "validate=no"],
-        )
-        .map_err(|e| {
+    fn apply_static(
+        &self,
+        idx: &str,
+        primary: &str,
+        secondaries: &[String],
+    ) -> Result<String, String> {
+        // validate=no — we trust the backup; validation issues an outbound DNS
+        // probe that fails on UDP-restricted networks (#147) and aborts the set.
+        self.netsh(
+            &[
+                "set",
+                "dnsservers",
+                idx,
+                "static",
+                primary,
+                "primary",
+                "validate=no",
+            ],
+            &format!("set primary {}", primary),
+        )?;
+        for (i, server) in secondaries.iter().enumerate() {
+            let idx_arg = format!("index={}", i + 2);
+            self.netsh(
+                &["add", "dnsservers", idx, server, &idx_arg, "validate=no"],
+                &format!("add {}", server),
+            )?;
+        }
+        let all = std::iter::once(primary)
+            .chain(secondaries.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!(
+            "restored {} DNS for \"{}\" -> {}",
+            self.family.label(),
+            self.name,
+            all
+        ))
+    }
+
+    fn apply_dhcp(&self, idx: &str) -> Result<String, String> {
+        self.netsh(&["set", "dnsservers", idx, "dhcp"], "reset")?;
+        Ok(format!(
+            "reset {} DNS for \"{}\" -> DHCP",
+            self.family.label(),
+            self.name
+        ))
+    }
+
+    fn netsh(&self, args: &[&str], action: &str) -> Result<(), String> {
+        let status = run_netsh(self.family, args).map_err(|e| {
             format!(
-                "failed to add {} DNS for \"{}\": {}",
-                family.label(),
-                name,
+                "failed to {} {} for \"{}\": {}",
+                action,
+                self.family.label(),
+                self.name,
                 e
             )
         })?;
         if !status.success() {
             return Err(format!(
-                "netsh failed to add {} {} for \"{}\"",
-                family.label(),
-                server,
-                name
+                "netsh failed to {} {} for \"{}\"",
+                action,
+                self.family.label(),
+                self.name
             ));
         }
+        Ok(())
     }
-
-    let all = std::iter::once(primary)
-        .chain(secondaries.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Ok(format!(
-        "restored {} DNS for \"{}\" -> {}",
-        family.label(),
-        name,
-        all
-    ))
-}
-
-#[cfg(windows)]
-fn apply_dhcp(family: AddressFamily, name: &str, if_index: u32) -> Result<String, String> {
-    let idx = if_index.to_string();
-    let status = run_netsh(family, &["set", "dnsservers", &idx, "dhcp"]).map_err(|e| {
-        format!(
-            "failed to reset {} DNS for \"{}\": {}",
-            family.label(),
-            name,
-            e
-        )
-    })?;
-    if !status.success() {
-        return Err(format!(
-            "netsh failed to reset {} DNS for \"{}\"",
-            family.label(),
-            name
-        ));
-    }
-    Ok(format!(
-        "reset {} DNS for \"{}\" -> DHCP",
-        family.label(),
-        name
-    ))
 }
 
 /// Copy the currently-running binary to the service install location. SCM
@@ -1237,7 +1206,7 @@ fn uninstall_windows() -> Result<(), String> {
     }
     let mut apply_failed = false;
     for action in &plan {
-        match apply_restore(action) {
+        match action.apply() {
             Ok(msg) => eprintln!("  {}", msg),
             Err(e) => {
                 eprintln!("  warning: {}", e);
