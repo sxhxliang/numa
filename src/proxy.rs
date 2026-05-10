@@ -7,7 +7,9 @@ use axum::response::IntoResponse;
 use axum::routing::{any, post};
 use axum::Router;
 use http_body_util::BodyExt;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper::StatusCode;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use log::{debug, error, info, warn};
@@ -18,7 +20,7 @@ use crate::config::ProxyProtocolConfig;
 use crate::ctx::ServerCtx;
 use crate::pp2::{self, PpConfig};
 
-type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
+type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 
 /// State passed to the DoH handler. Includes the remote address so
 /// `resolve_query` can log the client IP.
@@ -32,6 +34,20 @@ pub struct DohState {
 struct ProxyState {
     ctx: Arc<ServerCtx>,
     client: HttpClient,
+    tls_terminated: bool,
+}
+
+fn build_http_client() -> HttpClient {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let https = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
+    Client::builder(TokioExecutor::new())
+        .http1_preserve_header_case(true)
+        .build(https)
 }
 
 pub async fn start_proxy(ctx: Arc<ServerCtx>, port: u16, bind_addr: Ipv4Addr) {
@@ -48,11 +64,13 @@ pub async fn start_proxy(ctx: Arc<ServerCtx>, port: u16, bind_addr: Ipv4Addr) {
     };
     info!("HTTP proxy listening on {}", addr);
 
-    let client: HttpClient = Client::builder(TokioExecutor::new())
-        .http1_preserve_header_case(true)
-        .build_http();
+    let client = build_http_client();
 
-    let state = ProxyState { ctx, client };
+    let state = ProxyState {
+        ctx,
+        client,
+        tls_terminated: false,
+    };
 
     let app = Router::new().fallback(any(proxy_handler)).with_state(state);
 
@@ -95,13 +113,12 @@ async fn accept_loop_tls(
     ctx: Arc<ServerCtx>,
     pp: Option<Arc<PpConfig>>,
 ) {
-    let client: HttpClient = Client::builder(TokioExecutor::new())
-        .http1_preserve_header_case(true)
-        .build_http();
+    let client = build_http_client();
 
     let proxy_state = ProxyState {
         ctx: Arc::clone(&ctx),
         client,
+        tls_terminated: true,
     };
 
     // DoH route (RFC 8484) served only on the TLS listener.
@@ -292,7 +309,79 @@ pub fn extract_host(req: &Request) -> Option<String> {
         .map(|h| h.split(':').next().unwrap_or(h).to_lowercase())
 }
 
+fn html_response(status: StatusCode, title: String, body: String) -> axum::response::Response {
+    (
+        status,
+        [(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        error_page(&title, &body),
+    )
+        .into_response()
+}
+
+fn blocked_domain_response(hostname: &str) -> axum::response::Response {
+    let body = format!(
+        r#"  <div class="hero-text">&#x1f6e1;</div>
+  <div class="label">Blocked by Numa</div>
+  <div class="domain">{0}</div>
+  <p class="message">This domain is on the ad &amp; tracker blocklist.<br>To allow it, use the <a href="http://numa.numa">dashboard</a> or:</p>
+  <pre><span class="prompt">$</span> <span class="str">curl</span> <span class="flag">-X POST</span> localhost:5380/blocking/allowlist \
+    <span class="flag">-d</span> '<span class="str">{{"domain":"{0}"}}</span>'</pre>"#,
+        hostname
+    );
+    html_response(
+        StatusCode::FORBIDDEN,
+        format!("Blocked — {}", hostname),
+        body,
+    )
+}
+
+fn removed_domain_response(hostname: &str) -> axum::response::Response {
+    let body = format!(
+        r#"  <div class="hero-text">410</div>
+  <div class="label">Proxy Mapping Removed</div>
+  <div class="domain">{0}</div>
+  <p class="message">This domain is no longer registered in Numa.<br>You're most likely still hitting the local proxy because your browser or OS cached an earlier DNS answer.</p>
+  <pre><span class="prompt">#</span> <span class="str">Wait ~30 seconds for DNS cache expiry</span>
+<span class="prompt">#</span> <span class="str">or flush your local DNS cache / restart the browser</span></pre>"#,
+        hostname
+    );
+    html_response(
+        StatusCode::GONE,
+        format!("Removed — {}", hostname),
+        body,
+    )
+}
+
+fn missing_service_response(hostname: &str) -> axum::response::Response {
+    let body = format!(
+        r#"  <div class="hero-text">404</div>
+  <div class="domain">{0}</div>
+  <p class="message">This service isn't registered yet.<br>Add it from the <a href="http://numa.numa">dashboard</a> or:</p>
+  <pre><span class="prompt">$</span> <span class="str">curl</span> <span class="flag">-X POST</span> numa.numa:5380/services \
+    <span class="flag">-H</span> 'Content-Type: application/json' \
+    <span class="flag">-d</span> '<span class="str">{{"domain":"{0}","target_port":3000}}</span>'</pre>
+  <div class="aside">ma-ia hii, ma-ia huu, ma-ia haa, ma-ia ha-ha</div>"#,
+        hostname
+    );
+    html_response(StatusCode::NOT_FOUND, format!("404 — {}", hostname), body)
+}
+
+fn is_numa_proxy_domain(ctx: &ServerCtx, hostname: &str) -> bool {
+    !ctx.proxy_tld_suffix.is_empty()
+        && (hostname.ends_with(ctx.proxy_tld_suffix.as_str()) || hostname == ctx.proxy_tld)
+}
+
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> axum::response::Response {
+    enum RouteTarget {
+        Upstream {
+            scheme: &'static str,
+            host: String,
+            port: u16,
+            path: String,
+        },
+        Response(axum::response::Response),
+    }
+
     let hostname = match extract_host(&req) {
         Some(h) => h,
         None => {
@@ -300,69 +389,59 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> axum::r
         }
     };
 
-    let service_name = match hostname.strip_suffix(state.ctx.proxy_tld_suffix.as_str()) {
-        Some(name) => name.to_string(),
-        None => {
-            // Check if this domain was blocked — show a helpful styled page
-            if state.ctx.blocklist.read().unwrap().is_blocked(&hostname) {
-                let body = format!(
-                    r#"  <div class="hero-text">&#x1f6e1;</div>
-  <div class="label">Blocked by Numa</div>
-  <div class="domain">{0}</div>
-  <p class="message">This domain is on the ad &amp; tracker blocklist.<br>To allow it, use the <a href="http://numa.numa">dashboard</a> or:</p>
-  <pre><span class="prompt">$</span> <span class="str">curl</span> <span class="flag">-X POST</span> localhost:5380/blocking/allowlist \
-    <span class="flag">-d</span> '<span class="str">{{"domain":"{0}"}}</span>'</pre>"#,
-                    hostname
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    [(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    error_page(&format!("Blocked — {}", hostname), &body),
-                )
-                    .into_response();
-            }
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("not a {} domain: {}", state.ctx.proxy_tld_suffix, hostname),
-            )
-                .into_response();
-        }
-    };
-
     let request_path = req.uri().path().to_string();
 
-    let (target_host, target_port, rewritten_path) = {
+    let route_target = {
         let store = state.ctx.services.lock().unwrap();
-        if let Some(entry) = store.lookup(&service_name) {
+        if let Some(entry) = store.lookup(&hostname) {
             let (port, path) = entry.resolve_route(&request_path);
-            ("localhost".to_string(), port, path)
+            RouteTarget::Upstream {
+                scheme: "http",
+                host: "localhost".to_string(),
+                port,
+                path,
+            }
         } else {
+            drop(store);
             let mut peers = state.ctx.lan_peers.lock().unwrap();
-            match peers.lookup(&service_name) {
-                Some((ip, port)) => (ip.to_string(), port, request_path.clone()),
+            match peers.lookup(&hostname) {
+                Some((ip, port)) => RouteTarget::Upstream {
+                    scheme: "http",
+                    host: ip.to_string(),
+                    port,
+                    path: request_path.clone(),
+                },
                 None => {
-                    let body = format!(
-                        r#"  <div class="hero-text">404</div>
-  <div class="domain">{0}{1}</div>
-  <p class="message">This service isn't registered yet.<br>Add it from the <a href="http://numa.numa">dashboard</a> or:</p>
-  <pre><span class="prompt">$</span> <span class="str">curl</span> <span class="flag">-X POST</span> numa.numa:5380/services \
-    <span class="flag">-H</span> 'Content-Type: application/json' \
-    <span class="flag">-d</span> '<span class="str">{{"name":"{0}","target_port":3000}}</span>'</pre>
-  <div class="aside">ma-ia hii, ma-ia huu, ma-ia haa, ma-ia ha-ha</div>"#,
-                        service_name, state.ctx.proxy_tld_suffix
-                    );
-                    return (
-                        StatusCode::NOT_FOUND,
-                        [(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                        error_page(
-                            &format!("404 — {}{}", service_name, state.ctx.proxy_tld_suffix),
-                            &body,
-                        ),
-                    )
-                        .into_response();
+                    drop(peers);
+                    if state.ctx.blocklist.read().unwrap().is_blocked(&hostname) {
+                        RouteTarget::Response(blocked_domain_response(&hostname))
+                    } else if !is_numa_proxy_domain(&state.ctx, &hostname)
+                        && state.ctx.removed_proxy_domain_active(&hostname)
+                    {
+                        RouteTarget::Upstream {
+                            scheme: if state.tls_terminated { "https" } else { "http" },
+                            host: hostname.clone(),
+                            port: if state.tls_terminated { 443 } else { 80 },
+                            path: request_path.clone(),
+                        }
+                    } else if !is_numa_proxy_domain(&state.ctx, &hostname) {
+                        RouteTarget::Response(removed_domain_response(&hostname))
+                    } else {
+                        RouteTarget::Response(missing_service_response(&hostname))
+                    }
                 }
             }
         }
+    };
+
+    let (target_scheme, target_host, target_port, rewritten_path) = match route_target {
+        RouteTarget::Upstream {
+            scheme,
+            host,
+            port,
+            path,
+        } => (scheme, host, port, path),
+        RouteTarget::Response(resp) => return resp,
     };
 
     let query_string = req
@@ -371,8 +450,8 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> axum::r
         .map(|q| format!("?{}", q))
         .unwrap_or_default();
     let target_uri: hyper::Uri = format!(
-        "http://{}:{}{}{}",
-        target_host, target_port, rewritten_path, query_string
+        "{}://{}:{}{}{}",
+        target_scheme, target_host, target_port, rewritten_path, query_string
     )
     .parse()
     .unwrap();

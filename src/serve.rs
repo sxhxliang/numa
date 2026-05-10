@@ -74,9 +74,13 @@ pub async fn run(config_path: String) -> crate::Result<()> {
 
     // Build service store: config services + persisted user services
     let mut service_store = ServiceStore::new();
-    service_store.insert_from_config("numa", config.server.api_port, Vec::new());
+    service_store.insert_from_config(
+        &format!("{}.{}", config.proxy.tld, config.proxy.tld),
+        config.server.api_port,
+        Vec::new(),
+    );
     for svc in &config.services {
-        service_store.insert_from_config(&svc.name, svc.target_port, svc.routes.clone());
+        service_store.insert_from_config(&svc.domain, svc.target_port, svc.routes.clone());
     }
     service_store.load_persisted();
 
@@ -102,7 +106,7 @@ pub async fn run(config_path: String) -> crate::Result<()> {
 
     // Build initial TLS config before ServerCtx (so ArcSwap is ready at construction)
     let initial_tls = if config.proxy.enabled && config.proxy.tls_port > 0 {
-        let service_names = service_store.names();
+        let service_names = service_store.domains();
         match crate::tls::build_tls_config(
             &config.proxy.tld,
             &service_names,
@@ -165,6 +169,7 @@ pub async fn run(config_path: String) -> crate::Result<()> {
         blocklist: RwLock::new(blocklist),
         query_log: Mutex::new(QueryLog::new(1000)),
         services: Mutex::new(service_store),
+        removed_proxy_domains: Mutex::new(std::collections::HashMap::new()),
         lan_peers: Mutex::new(crate::lan::PeerStore::new(config.lan.peer_timeout_secs)),
         forwarding_rules,
         upstream_pool: Mutex::new(pool),

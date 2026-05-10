@@ -36,6 +36,7 @@ pub async fn test_ctx() -> ServerCtx {
         blocklist: RwLock::new(BlocklistStore::new()),
         query_log: Mutex::new(QueryLog::new(100)),
         services: Mutex::new(ServiceStore::new()),
+        removed_proxy_domains: Mutex::new(HashMap::new()),
         lan_peers: Mutex::new(PeerStore::new(90)),
         forwarding_rules: Vec::new(),
         upstream_pool: Mutex::new(UpstreamPool::new(

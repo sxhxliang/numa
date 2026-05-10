@@ -3,7 +3,7 @@
 //! Read-only subset of Numa's HTTP surface served on a separate port
 //! (default 8765) bound to the LAN. Unlike the main API on port 5380
 //! (which defaults to `127.0.0.1` and serves mutating routes like
-//! `DELETE /services/{name}` or `PUT /blocking/toggle`), this listener
+//! `DELETE /services/{domain}` or `PUT /blocking/toggle`), this listener
 //! is safe to expose on the LAN because every route is idempotent and
 //! read-only.
 //!

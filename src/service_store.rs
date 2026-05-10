@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServiceEntry {
-    pub name: String,
+    #[serde(alias = "name")]
+    pub domain: String,
     pub target_port: u16,
     #[serde(default)]
     pub routes: Vec<RouteEntry>,
@@ -78,13 +79,13 @@ impl ServiceStore {
     }
 
     /// Insert a service from numa.toml config (not persisted)
-    pub fn insert_from_config(&mut self, name: &str, target_port: u16, routes: Vec<RouteEntry>) {
-        let key = name.to_lowercase();
+    pub fn insert_from_config(&mut self, domain: &str, target_port: u16, routes: Vec<RouteEntry>) {
+        let key = domain.to_lowercase();
         self.config_services.insert(key.clone());
         self.entries.insert(
             key.clone(),
             ServiceEntry {
-                name: key,
+                domain: key,
                 target_port,
                 routes,
             },
@@ -92,12 +93,12 @@ impl ServiceStore {
     }
 
     /// Insert a user-defined service (persisted to ~/.config/numa/services.json)
-    pub fn insert(&mut self, name: &str, target_port: u16) {
-        let key = name.to_lowercase();
+    pub fn insert(&mut self, domain: &str, target_port: u16) {
+        let key = domain.to_lowercase();
         self.entries.insert(
             key.clone(),
             ServiceEntry {
-                name: key,
+                domain: key,
                 target_port,
                 routes: Vec::new(),
             },
@@ -130,12 +131,12 @@ impl ServiceStore {
         false
     }
 
-    pub fn lookup(&self, name: &str) -> Option<&ServiceEntry> {
-        self.entries.get(&name.to_lowercase())
+    pub fn lookup(&self, domain: &str) -> Option<&ServiceEntry> {
+        self.entries.get(&domain.to_lowercase())
     }
 
-    pub fn remove(&mut self, name: &str) -> bool {
-        let key = name.to_lowercase();
+    pub fn remove(&mut self, domain: &str) -> bool {
+        let key = domain.to_lowercase();
         let removed = self.entries.remove(&key).is_some();
         if removed {
             self.save();
@@ -144,23 +145,23 @@ impl ServiceStore {
     }
 
     /// Names are always stored lowercased, so callers must pass lowercase keys.
-    pub fn is_config_service(&self, name: &str) -> bool {
-        self.config_services.contains(name)
+    pub fn is_config_service(&self, domain: &str) -> bool {
+        self.config_services.contains(domain)
     }
 
     pub fn list(&self) -> Vec<&ServiceEntry> {
         let mut entries: Vec<_> = self.entries.values().collect();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries.sort_by(|a, b| a.domain.cmp(&b.domain));
         entries
     }
 
-    pub fn names(&self) -> Vec<String> {
+    pub fn domains(&self) -> Vec<String> {
         self.entries.keys().cloned().collect()
     }
 
-    /// Returns true if the name is new (not already registered).
-    pub fn has_name(&self, name: &str) -> bool {
-        self.entries.contains_key(&name.to_lowercase())
+    /// Returns true if the domain is new (not already registered).
+    pub fn has_domain(&self, domain: &str) -> bool {
+        self.entries.contains_key(&domain.to_lowercase())
     }
 
     /// Load user-defined services from ~/.config/numa/services.json
@@ -173,10 +174,17 @@ impl ServiceStore {
                 Ok(entries) => {
                     let count = entries.len();
                     for entry in entries {
-                        let key = entry.name.to_lowercase();
+                        let key = entry.domain.to_lowercase();
                         // Don't overwrite config-defined services
                         if !self.config_services.contains(&key) {
-                            self.entries.insert(key, entry);
+                            self.entries.insert(
+                                key,
+                                ServiceEntry {
+                                    domain: entry.domain.to_lowercase(),
+                                    target_port: entry.target_port,
+                                    routes: entry.routes,
+                                },
+                            );
                         }
                     }
                     if count > 0 {
@@ -197,7 +205,7 @@ impl ServiceStore {
         let user_services: Vec<&ServiceEntry> = self
             .entries
             .values()
-            .filter(|e| !self.config_services.contains(&e.name))
+            .filter(|e| !self.config_services.contains(&e.domain))
             .collect();
 
         if let Some(parent) = self.persist_path.parent() {
@@ -226,7 +234,7 @@ mod tests {
 
     fn entry(port: u16, routes: Vec<RouteEntry>) -> ServiceEntry {
         ServiceEntry {
-            name: "app".into(),
+            domain: "app.numa".into(),
             target_port: port,
             routes,
         }
@@ -324,9 +332,9 @@ mod tests {
     #[test]
     fn add_route_to_existing_service() {
         let mut store = test_store();
-        store.insert_from_config("app", 3000, vec![]);
-        assert!(store.add_route("app", "/api".into(), 4000, false));
-        let entry = store.lookup("app").unwrap();
+        store.insert_from_config("app.numa", 3000, vec![]);
+        assert!(store.add_route("app.numa", "/api".into(), 4000, false));
+        let entry = store.lookup("app.numa").unwrap();
         assert_eq!(entry.routes.len(), 1);
         assert_eq!(entry.routes[0].path, "/api");
     }
@@ -340,10 +348,10 @@ mod tests {
     #[test]
     fn add_route_deduplicates_by_path() {
         let mut store = test_store();
-        store.insert_from_config("app", 3000, vec![]);
-        store.add_route("app", "/api".into(), 4000, false);
-        store.add_route("app", "/api".into(), 5000, true);
-        let entry = store.lookup("app").unwrap();
+        store.insert_from_config("app.numa", 3000, vec![]);
+        store.add_route("app.numa", "/api".into(), 4000, false);
+        store.add_route("app.numa", "/api".into(), 5000, true);
+        let entry = store.lookup("app.numa").unwrap();
         assert_eq!(entry.routes.len(), 1);
         assert_eq!(entry.routes[0].port, 5000);
         assert!(entry.routes[0].strip);
@@ -352,23 +360,23 @@ mod tests {
     #[test]
     fn remove_route_returns_true_when_found() {
         let mut store = test_store();
-        store.insert_from_config("app", 3000, vec![route("/api", 4000, false)]);
-        assert!(store.remove_route("app", "/api"));
-        assert!(store.lookup("app").unwrap().routes.is_empty());
+        store.insert_from_config("app.numa", 3000, vec![route("/api", 4000, false)]);
+        assert!(store.remove_route("app.numa", "/api"));
+        assert!(store.lookup("app.numa").unwrap().routes.is_empty());
     }
 
     #[test]
     fn remove_route_returns_false_when_missing() {
         let mut store = test_store();
-        store.insert_from_config("app", 3000, vec![]);
-        assert!(!store.remove_route("app", "/nope"));
+        store.insert_from_config("app.numa", 3000, vec![]);
+        assert!(!store.remove_route("app.numa", "/nope"));
     }
 
     #[test]
     fn lookup_is_case_insensitive() {
         let mut store = test_store();
-        store.insert_from_config("MyApp", 3000, vec![]);
-        assert!(store.lookup("myapp").is_some());
-        assert!(store.lookup("MYAPP").is_some());
+        store.insert_from_config("MyApp.Numa", 3000, vec![]);
+        assert!(store.lookup("myapp.numa").is_some());
+        assert!(store.lookup("MYAPP.NUMA").is_some());
     }
 }

@@ -138,11 +138,11 @@ tld = "numa"
 
 # Pre-configured services (numa.numa is always added automatically)
 # [[services]]
-# name = "frontend"
+# domain = "frontend.numa"   # or "frontend" for legacy shorthand
 # target_port = 5173
 #
 # [[services]]
-# name = "api"
+# domain = "api.example.com"
 # target_port = 8000
 
 # Example zone records:

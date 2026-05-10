@@ -29,14 +29,15 @@ pub fn regenerate_tls(ctx: &ServerCtx) {
         None => return,
     };
 
-    let mut names: HashSet<String> = ctx.services.lock().unwrap().names().into_iter().collect();
+    let mut names: HashSet<String> = ctx.services.lock().unwrap().domains().into_iter().collect();
+    names.extend(ctx.active_removed_proxy_domains());
     names.extend(ctx.lan_peers.lock().unwrap().names());
-    let names: Vec<String> = names.into_iter().collect();
+    let domains: Vec<String> = names.into_iter().collect();
 
-    match build_tls_config(&ctx.proxy_tld, &names, Vec::new(), &ctx.data_dir) {
+    match build_tls_config(&ctx.proxy_tld, &domains, Vec::new(), &ctx.data_dir) {
         Ok(new_config) => {
             tls.store(new_config);
-            info!("TLS cert regenerated for {} services", names.len());
+            info!("TLS cert regenerated for {} services", domains.len());
         }
         Err(e) => warn!("TLS regeneration failed: {}", e),
     }
@@ -77,7 +78,7 @@ pub fn try_data_dir_advisory(err: &crate::Error, data_dir: &Path) -> Option<Stri
     ))
 }
 
-/// Build a TLS config with a cert covering all provided service names.
+/// Build a TLS config with a cert covering all provided service domains.
 /// Wildcards under single-label TLDs (*.numa) are rejected by browsers,
 /// so we list each service explicitly as a SAN.
 /// `alpn` is advertised in the TLS ServerHello — pass empty for the proxy
@@ -86,12 +87,12 @@ pub fn try_data_dir_advisory(err: &crate::Error, data_dir: &Path) -> Option<Stri
 /// `[server] data_dir` in numa.toml (defaults to `crate::data_dir()`).
 pub fn build_tls_config(
     tld: &str,
-    service_names: &[String],
+    service_domains: &[String],
     alpn: Vec<Vec<u8>>,
     data_dir: &Path,
 ) -> crate::Result<Arc<ServerConfig>> {
     let (ca_der, issuer) = ensure_ca(data_dir)?;
-    let (cert_chain, key) = generate_service_cert(&ca_der, &issuer, tld, service_names)?;
+    let (cert_chain, key) = generate_service_cert(&ca_der, &issuer, tld, service_domains)?;
 
     // Ensure a crypto provider is installed (rustls needs one)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -103,7 +104,7 @@ pub fn build_tls_config(
 
     info!(
         "TLS configured for {} .{} domains",
-        service_names.len(),
+        service_domains.len(),
         tld
     );
     Ok(Arc::new(config))
@@ -155,13 +156,13 @@ fn ensure_ca(dir: &Path) -> crate::Result<(CertificateDer<'static>, Issuer<'stat
     Ok((ca_der, issuer))
 }
 
-/// Generate a cert with explicit SANs for each service name.
+/// Generate a cert with explicit SANs for each service domain.
 /// Always regenerated at startup (~5ms) — no disk caching needed.
 fn generate_service_cert(
     ca_der: &CertificateDer<'static>,
     issuer: &Issuer<'_, KeyPair>,
     tld: &str,
-    service_names: &[String],
+    service_domains: &[String],
 ) -> crate::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let key_pair = KeyPair::generate()?;
     let mut params = CertificateParams::default();
@@ -171,18 +172,17 @@ fn generate_service_cert(
 
     // Add a wildcard SAN so any .numa domain gets a valid cert (including
     // unregistered services — lets the proxy show a styled 404 over HTTPS).
-    // Also add each service explicitly for clients that don't match wildcards.
+    // Also add each registered service domain explicitly.
     let mut sans = Vec::new();
     let wildcard = format!("*.{}", tld);
     match wildcard.clone().try_into() {
         Ok(ia5) => sans.push(SanType::DnsName(ia5)),
         Err(e) => warn!("invalid wildcard SAN {}: {}", wildcard, e),
     }
-    for name in service_names {
-        let fqdn = format!("{}.{}", name, tld);
-        match fqdn.clone().try_into() {
+    for domain in service_domains {
+        match domain.clone().try_into() {
             Ok(ia5) => sans.push(SanType::DnsName(ia5)),
-            Err(e) => warn!("invalid SAN {}: {}", fqdn, e),
+            Err(e) => warn!("invalid SAN {}: {}", domain, e),
         }
     }
 
@@ -209,11 +209,7 @@ fn generate_service_cert(
 
     info!(
         "generated TLS cert for: {}",
-        service_names
-            .iter()
-            .map(|n| format!("{}.{}", n, tld))
-            .collect::<Vec<_>>()
-            .join(", ")
+        service_domains.join(", ")
     );
 
     let cert_der = cert.der().clone();
@@ -260,7 +256,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let (ca_der, issuer) = ensure_ca(&dir).unwrap();
 
-        let names = vec!["grafana".into(), "router".into()];
+        let names = vec!["grafana.numa".into(), "router.numa".into()];
         let (chain, _) = generate_service_cert(&ca_der, &issuer, "numa", &names).unwrap();
         assert_eq!(chain.len(), 2, "chain should be [leaf, CA]");
 

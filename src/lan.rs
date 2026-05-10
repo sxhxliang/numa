@@ -180,7 +180,7 @@ pub async fn start_lan_discovery(ctx: Arc<ServerCtx>, config: &LanConfig) {
                 store
                     .list()
                     .iter()
-                    .map(|e| (e.name.clone(), e.target_port))
+                    .map(|e| (e.domain.clone(), e.target_port))
                     .collect()
             };
             // Note: we always announce ourselves, even when the

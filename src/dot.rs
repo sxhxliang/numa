@@ -48,14 +48,15 @@ fn load_tls_config(cert_path: &Path, key_path: &Path) -> crate::Result<Arc<Serve
 /// Build a self-signed DoT TLS config. Can't reuse `ctx.tls_config` (the
 /// proxy's shared config) because DoT needs its own ALPN advertisement.
 ///
-/// Pass `proxy_tld` itself as a service name so the cert gets an explicit
-/// `{tld}.{tld}` SAN (e.g. "numa.numa") matching the ServerName that
+/// Pass `{tld}.{tld}` as a service domain so the cert gets an explicit
+/// `numa.numa`-style SAN matching the ServerName that
 /// setup-phone's mobileconfig sends as SNI. The `*.{tld}` wildcard alone
 /// is rejected by strict TLS clients under single-label TLDs (per the
 /// note in tls.rs::generate_service_cert).
 fn self_signed_tls(ctx: &ServerCtx) -> Option<Arc<ServerConfig>> {
-    let service_names = [ctx.proxy_tld.clone()];
-    match crate::tls::build_tls_config(&ctx.proxy_tld, &service_names, dot_alpn(), &ctx.data_dir) {
+    let service_domains = [format!("{}.{}", ctx.proxy_tld, ctx.proxy_tld)];
+    match crate::tls::build_tls_config(&ctx.proxy_tld, &service_domains, dot_alpn(), &ctx.data_dir)
+    {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             warn!(

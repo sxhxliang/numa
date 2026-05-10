@@ -85,6 +85,45 @@ pub fn discover_system_dns() -> SystemDnsInfo {
     }
 }
 
+/// Best-effort local DNS cache flush after service add/remove so the
+/// current machine is more likely to re-query Numa immediately.
+///
+/// This cannot invalidate browser-internal caches or caches on other
+/// devices; it only nudges the host OS toward dropping stale answers.
+pub fn best_effort_flush_local_dns_cache() {
+    std::thread::spawn(|| {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("dscacheutil")
+                .args(["-flushcache"])
+                .status();
+            let _ = std::process::Command::new("killall")
+                .args(["-HUP", "mDNSResponder"])
+                .status();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("resolvectl")
+                .args(["flush-caches"])
+                .status();
+            let _ = std::process::Command::new("systemd-resolve")
+                .args(["--flush-caches"])
+                .status();
+            let _ = std::process::Command::new("nscd")
+                .args(["-i", "hosts"])
+                .status();
+        }
+
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("ipconfig")
+                .args(["/flushdns"])
+                .status();
+        }
+    });
+}
+
 /// Advisory for port-53 bind failures (EADDRINUSE or EACCES); `None`
 /// if not applicable so the caller can fall back to the raw error.
 pub fn try_port53_advisory(bind_addr: &str, err: &std::io::Error) -> Option<String> {

@@ -20,6 +20,7 @@ env_logger = "0.11"
 reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "http2"], default-features = false }
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = "0.27"
 http-body-util = "0.1"
 futures = "0.3"
 socket2 = { version = "0.6", features = ["all"] }
@@ -39,6 +40,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 webpki-roots = "1"
 proxy-header = { version = "0.1", features = ["tokio"] }
 ipnet = { version = "2", features = ["serde"] }
+idna = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

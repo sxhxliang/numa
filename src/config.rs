@@ -630,7 +630,8 @@ fn default_proxy_tld() -> String {
 
 #[derive(Deserialize, Clone)]
 pub struct ServiceConfig {
-    pub name: String,
+    #[serde(alias = "name")]
+    pub domain: String,
     pub target_port: u16,
     #[serde(default)]
     pub routes: Vec<crate::service_store::RouteEntry>,

@@ -44,6 +44,7 @@ pub struct ServerCtx {
     pub blocklist: RwLock<BlocklistStore>,
     pub query_log: Mutex<QueryLog>,
     pub services: Mutex<ServiceStore>,
+    pub removed_proxy_domains: Mutex<HashMap<String, Instant>>,
     pub lan_peers: Mutex<PeerStore>,
     pub forwarding_rules: Vec<ForwardingRule>,
     pub upstream_pool: Mutex<UpstreamPool>,
@@ -81,6 +82,36 @@ pub struct ServerCtx {
     /// answer) instead of hitting cache/forwarding/upstream. Local data
     /// (overrides, zones, .numa proxy, blocklist sinkhole) is unaffected.
     pub filter_aaaa: bool,
+}
+
+pub const REMOVED_PROXY_DOMAIN_GRACE_PERIOD: Duration = Duration::from_secs(120);
+
+impl ServerCtx {
+    fn prune_removed_proxy_domains(
+        guard: &mut std::sync::MutexGuard<'_, HashMap<String, Instant>>,
+    ) {
+        let now = Instant::now();
+        guard.retain(|_, expires_at| *expires_at > now);
+    }
+
+    pub fn mark_removed_proxy_domain(&self, domain: &str) {
+        self.removed_proxy_domains
+            .lock()
+            .unwrap()
+            .insert(domain.to_lowercase(), Instant::now() + REMOVED_PROXY_DOMAIN_GRACE_PERIOD);
+    }
+
+    pub fn removed_proxy_domain_active(&self, domain: &str) -> bool {
+        let mut guard = self.removed_proxy_domains.lock().unwrap();
+        Self::prune_removed_proxy_domains(&mut guard);
+        guard.contains_key(&domain.to_lowercase())
+    }
+
+    pub fn active_removed_proxy_domains(&self) -> Vec<String> {
+        let mut guard = self.removed_proxy_domains.lock().unwrap();
+        Self::prune_removed_proxy_domains(&mut guard);
+        guard.keys().cloned().collect()
+    }
 }
 
 /// Transport-agnostic DNS resolution. Runs the full pipeline (overrides, blocklist,
@@ -270,6 +301,11 @@ fn resolve_local(
         let resp = special_use_response(query, qname, qtype);
         return Some((resp, QueryPath::Local, DnssecStatus::Indeterminate));
     }
+    if ctx.services.lock().unwrap().lookup(qname).is_some()
+        || ctx.lan_peers.lock().unwrap().lookup(qname).is_some()
+    {
+        return Some(resolve_proxy_tld(query, src_addr, qname, qtype, ctx));
+    }
     if !ctx.proxy_tld_suffix.is_empty()
         && (qname.ends_with(&ctx.proxy_tld_suffix) || qname == ctx.proxy_tld)
     {
@@ -304,11 +340,10 @@ fn resolve_proxy_tld(
     qtype: QueryType,
     ctx: &ServerCtx,
 ) -> (DnsPacket, QueryPath, DnssecStatus) {
-    let service_name = qname.strip_suffix(&ctx.proxy_tld_suffix).unwrap_or(qname);
     let is_remote = !src_addr.ip().is_loopback();
     let resolve_ip = {
         let local = ctx.services.lock().unwrap();
-        if local.lookup(service_name).is_some() {
+        if local.lookup(qname).is_some() {
             if is_remote {
                 *ctx.lan_ip.lock().unwrap()
             } else {
@@ -317,7 +352,7 @@ fn resolve_proxy_tld(
         } else {
             let mut peers = ctx.lan_peers.lock().unwrap();
             peers
-                .lookup(service_name)
+                .lookup(qname)
                 .and_then(|(ip, _)| match ip {
                     std::net::IpAddr::V4(v4) => Some(v4),
                     _ => None,
@@ -331,8 +366,10 @@ fn resolve_proxy_tld(
         resolve_ip.to_ipv6_mapped()
     };
     let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
+    // Keep service-domain answers short-lived so removing a service stops
+    // intercepting that domain quickly even if the client cached our answer.
     resp.answers
-        .push(sinkhole_record(qname, qtype, resolve_ip, v6, 300));
+        .push(sinkhole_record(qname, qtype, resolve_ip, v6, 30));
     (resp, QueryPath::Local, DnssecStatus::Indeterminate)
 }
 
@@ -1294,7 +1331,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_tld_proxy_resolves_service() {
         let ctx = crate::testutil::test_ctx().await;
-        ctx.services.lock().unwrap().insert("grafana", 3000);
+        ctx.services.lock().unwrap().insert("grafana.numa", 3000);
         let ctx = Arc::new(ctx);
 
         let (resp, path) = resolve_in_test(&ctx, "grafana.numa", QueryType::A).await;

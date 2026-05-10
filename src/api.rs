@@ -52,10 +52,10 @@ pub fn router(ctx: Arc<ServerCtx>) -> Router {
         )
         .route("/services", get(list_services))
         .route("/services", post(create_service))
-        .route("/services/{name}", delete(remove_service))
-        .route("/services/{name}/routes", get(list_routes))
-        .route("/services/{name}/routes", post(add_route))
-        .route("/services/{name}/routes", delete(remove_route))
+        .route("/services/{domain}", delete(remove_service))
+        .route("/services/{domain}/routes", get(list_routes))
+        .route("/services/{domain}/routes", post(add_route))
+        .route("/services/{domain}/routes", delete(remove_route))
         .route("/ca.pem", get(serve_ca))
         .route("/qr", get(serve_qr))
         .route("/fonts/fonts.css", get(serve_fonts_css))
@@ -779,7 +779,7 @@ async fn blocking_allowlist_remove(
 
 #[derive(Serialize)]
 struct ServiceResponse {
-    name: String,
+    domain: String,
     target_port: u16,
     url: String,
     healthy: bool,
@@ -791,8 +791,56 @@ struct ServiceResponse {
 
 #[derive(Deserialize)]
 struct CreateServiceRequest {
-    name: String,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     target_port: u16,
+}
+
+fn normalize_service_domain(
+    domain: Option<&str>,
+    name: Option<&str>,
+    proxy_tld: &str,
+) -> Result<String, String> {
+    let raw = match (domain, name) {
+        (Some(domain), _) if !domain.trim().is_empty() => domain.trim(),
+        (_, Some(name)) if !name.trim().is_empty() => name.trim(),
+        _ => return Err("domain is required".into()),
+    };
+
+    let raw = raw.trim_end_matches('.');
+    if raw.is_empty() {
+        return Err("domain is required".into());
+    }
+
+    let candidate = if raw.contains('.') || proxy_tld.is_empty() {
+        raw.to_string()
+    } else {
+        format!("{}.{}", raw, proxy_tld)
+    };
+
+    let ascii = idna::domain_to_ascii(&candidate)
+        .map_err(|_| "domain must be a valid hostname".to_string())?
+        .to_lowercase();
+
+    if ascii.len() > 253 {
+        return Err("domain must be 1-253 characters".into());
+    }
+
+    for label in ascii.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("domain labels must be 1-63 characters".into());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("domain labels must not start or end with '-'".into());
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("domain must contain only valid hostname characters".into());
+        }
+    }
+
+    Ok(ascii)
 }
 
 async fn list_services(State(ctx): State<Arc<ServerCtx>>) -> Json<Vec<ServiceResponse>> {
@@ -802,13 +850,13 @@ async fn list_services(State(ctx): State<Arc<ServerCtx>>) -> Json<Vec<ServiceRes
             .list()
             .into_iter()
             .map(|e| {
-                let source = if store.is_config_service(&e.name) {
+                let source = if store.is_config_service(&e.domain) {
                     "config"
                 } else {
                     "api"
                 };
                 (
-                    e.name.clone(),
+                    e.domain.clone(),
                     e.target_port,
                     e.routes.clone(),
                     source.to_string(),
@@ -816,7 +864,6 @@ async fn list_services(State(ctx): State<Arc<ServerCtx>>) -> Json<Vec<ServiceRes
             })
             .collect()
     };
-    let tld = &ctx.proxy_tld;
 
     let lan_ip = crate::lan::detect_lan_ip();
 
@@ -842,9 +889,9 @@ async fn list_services(State(ctx): State<Arc<ServerCtx>>) -> Json<Vec<ServiceRes
         .into_iter()
         .zip(check_results)
         .map(
-            |((name, port, routes, source), (healthy, lan_accessible))| ServiceResponse {
-                url: format!("http://{}.{}", name, tld),
-                name,
+            |((domain, port, routes, source), (healthy, lan_accessible))| ServiceResponse {
+                url: format!("http://{}", domain),
+                domain,
                 target_port: port,
                 healthy,
                 lan_accessible,
@@ -860,31 +907,22 @@ async fn create_service(
     State(ctx): State<Arc<ServerCtx>>,
     Json(req): Json<CreateServiceRequest>,
 ) -> Result<(StatusCode, Json<ServiceResponse>), (StatusCode, String)> {
-    let name = req.name.to_lowercase();
-
-    // Validate name: alphanumeric + hyphens only, 1-63 chars
-    if name.is_empty() || name.len() > 63 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "name must be 1-63 characters".into(),
-        ));
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "name must contain only alphanumeric characters and hyphens".into(),
-        ));
-    }
+    let domain = normalize_service_domain(
+        req.domain.as_deref(),
+        req.name.as_deref(),
+        &ctx.proxy_tld,
+    )
+    .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     if req.target_port == 0 {
         return Err((StatusCode::BAD_REQUEST, "target_port must be > 0".into()));
     }
 
-    let tld = &ctx.proxy_tld;
-    let is_new = !ctx.services.lock().unwrap().has_name(&name);
-    ctx.services.lock().unwrap().insert(&name, req.target_port);
+    let is_new = !ctx.services.lock().unwrap().has_domain(&domain);
+    ctx.services.lock().unwrap().insert(&domain, req.target_port);
     if is_new {
         crate::tls::regenerate_tls(&ctx);
     }
+    crate::system_dns::best_effort_flush_local_dns_cache();
 
     let localhost = std::net::SocketAddr::from(([127, 0, 0, 1], req.target_port));
     let lan_addr =
@@ -898,8 +936,8 @@ async fn create_service(
     Ok((
         StatusCode::CREATED,
         Json(ServiceResponse {
-            url: format!("http://{}.{}", name, tld),
-            name,
+            url: format!("http://{}", domain),
+            domain,
             target_port: req.target_port,
             healthy,
             lan_accessible,
@@ -909,13 +947,18 @@ async fn create_service(
     ))
 }
 
-async fn remove_service(State(ctx): State<Arc<ServerCtx>>, Path(name): Path<String>) -> StatusCode {
-    if name.eq_ignore_ascii_case("numa") {
+async fn remove_service(
+    State(ctx): State<Arc<ServerCtx>>,
+    Path(domain): Path<String>,
+) -> StatusCode {
+    if domain.eq_ignore_ascii_case(&format!("{}.{}", ctx.proxy_tld, ctx.proxy_tld)) {
         return StatusCode::FORBIDDEN;
     }
-    let removed = ctx.services.lock().unwrap().remove(&name);
+    let removed = ctx.services.lock().unwrap().remove(&domain);
     if removed {
+        ctx.mark_removed_proxy_domain(&domain);
         crate::tls::regenerate_tls(&ctx);
+        crate::system_dns::best_effort_flush_local_dns_cache();
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -939,10 +982,10 @@ struct RemoveRouteRequest {
 
 async fn list_routes(
     State(ctx): State<Arc<ServerCtx>>,
-    Path(name): Path<String>,
+    Path(domain): Path<String>,
 ) -> Result<Json<Vec<crate::service_store::RouteEntry>>, StatusCode> {
     let store = ctx.services.lock().unwrap();
-    match store.lookup(&name) {
+    match store.lookup(&domain) {
         Some(entry) => Ok(Json(entry.routes.clone())),
         None => Err(StatusCode::NOT_FOUND),
     }
@@ -950,7 +993,7 @@ async fn list_routes(
 
 async fn add_route(
     State(ctx): State<Arc<ServerCtx>>,
-    Path(name): Path<String>,
+    Path(domain): Path<String>,
     Json(req): Json<AddRouteRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if req.path.is_empty() || !req.path.starts_with('/') {
@@ -966,23 +1009,23 @@ async fn add_route(
         return Err((StatusCode::BAD_REQUEST, "port must be > 0".into()));
     }
     let mut store = ctx.services.lock().unwrap();
-    if store.add_route(&name, req.path, req.port, req.strip) {
+    if store.add_route(&domain, req.path, req.port, req.strip) {
         Ok(StatusCode::CREATED)
     } else {
         Err((
             StatusCode::NOT_FOUND,
-            format!("service '{}' not found", name),
+            format!("service '{}' not found", domain),
         ))
     }
 }
 
 async fn remove_route(
     State(ctx): State<Arc<ServerCtx>>,
-    Path(name): Path<String>,
+    Path(domain): Path<String>,
     Json(req): Json<RemoveRouteRequest>,
 ) -> StatusCode {
     let mut store = ctx.services.lock().unwrap();
-    if store.remove_route(&name, &req.path) {
+    if store.remove_route(&domain, &req.path) {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -1213,7 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn services_crud() {
         let ctx = test_ctx().await;
-        let a = router(ctx);
+        let a = router(ctx.clone());
 
         // Add service
         let resp = a
@@ -1221,7 +1264,9 @@ mod tests {
             .oneshot(
                 Request::post("/services")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"testapp","target_port":3000}"#))
+                    .body(Body::from(
+                        r#"{"domain":"api.example.com","target_port":3000}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1235,19 +1280,20 @@ mod tests {
             .await
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 10000).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("testapp"));
+        assert!(String::from_utf8_lossy(&body).contains("api.example.com"));
 
         // Delete
         let resp = a
             .clone()
             .oneshot(
-                Request::delete("/services/testapp")
+                Request::delete("/services/api.example.com")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert!(resp.status().is_success());
+        assert!(ctx.removed_proxy_domain_active("api.example.com"));
 
         // Verify deleted
         let resp = a
@@ -1255,7 +1301,29 @@ mod tests {
             .await
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 10000).await.unwrap();
-        assert!(!String::from_utf8_lossy(&body).contains("testapp"));
+        assert!(!String::from_utf8_lossy(&body).contains("api.example.com"));
+    }
+
+    #[tokio::test]
+    async fn services_accept_legacy_name_and_expand_to_proxy_tld() {
+        let ctx = test_ctx().await;
+        let a = router(ctx);
+
+        let resp = a
+            .clone()
+            .oneshot(
+                Request::post("/services")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"frontend","target_port":3000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let body = axum::body::to_bytes(resp.into_body(), 10000).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["domain"], "frontend.numa");
     }
 
     #[tokio::test]
