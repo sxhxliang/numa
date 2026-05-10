@@ -9,6 +9,12 @@ const DECAY_AFTER_SECS: u64 = 300;
 const MAX_ENTRIES: usize = 4096;
 const EVICT_BATCH: usize = 64;
 
+/// Failover circuit-breaker threshold: a primary upstream at or above this
+/// SRTT is skipped when a fallback is available. Calibrated between
+/// `INITIAL_SRTT_MS` and `FAILURE_PENALTY_MS` so a single failure trips it
+/// and decay un-trips it within ~5 minutes.
+pub const PRIMARY_SKIP_SRTT_MS: u64 = 4000;
+
 struct SrttEntry {
     srtt_ms: u64,
     updated_at: Instant,

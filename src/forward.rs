@@ -16,6 +16,10 @@ use crate::Result;
 #[derive(Clone)]
 pub enum Upstream {
     Udp(SocketAddr),
+    /// Plain DNS over TCP (RFC 1035 §4.2.2). Used as a UDP-fallback transport
+    /// on networks that block outbound UDP:53 to non-self resolvers — common
+    /// at carriers running BCP 38-style amplification mitigation.
+    Tcp(SocketAddr),
     Doh {
         url: String,
         client: reqwest::Client,
@@ -42,7 +46,9 @@ impl Upstream {
     /// single IP to track; SRTT is skipped for them.
     pub fn tracked_ip(&self) -> Option<IpAddr> {
         match self {
-            Upstream::Udp(addr) | Upstream::Dot { addr, .. } => Some(addr.ip()),
+            Upstream::Udp(addr) | Upstream::Tcp(addr) | Upstream::Dot { addr, .. } => {
+                Some(addr.ip())
+            }
             Upstream::Doh { .. } | Upstream::Odoh { .. } => None,
         }
     }
@@ -50,6 +56,7 @@ impl Upstream {
     pub fn transport(&self) -> UpstreamTransport {
         match self {
             Upstream::Udp(_) => UpstreamTransport::Udp,
+            Upstream::Tcp(_) => UpstreamTransport::Tcp,
             Upstream::Doh { .. } => UpstreamTransport::Doh,
             Upstream::Dot { .. } => UpstreamTransport::Dot,
             Upstream::Odoh { .. } => UpstreamTransport::Odoh,
@@ -61,6 +68,7 @@ impl PartialEq for Upstream {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Udp(a), Self::Udp(b)) => a == b,
+            (Self::Tcp(a), Self::Tcp(b)) => a == b,
             (Self::Doh { url: a, .. }, Self::Doh { url: b, .. }) => a == b,
             (Self::Dot { addr: a, .. }, Self::Dot { addr: b, .. }) => a == b,
             (
@@ -92,6 +100,7 @@ impl fmt::Display for Upstream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Upstream::Udp(addr) => write!(f, "{}", addr),
+            Upstream::Tcp(addr) => write!(f, "tcp://{}", addr),
             Upstream::Doh { url, .. } => f.write_str(url),
             Upstream::Dot { addr, tls_name, .. } => match tls_name {
                 Some(name) => write!(f, "tls://{}#{}", addr, name),
@@ -163,6 +172,11 @@ pub fn parse_upstream(
             tls_name,
             connector,
         });
+    }
+    // tcp://IP:PORT  or  tcp://IP  (default port = `default_port`, typically 53)
+    if let Some(rest) = s.strip_prefix("tcp://") {
+        let addr = parse_upstream_addr(rest, default_port)?;
+        return Ok(Upstream::Tcp(addr));
     }
     let addr = parse_upstream_addr(s, default_port)?;
     Ok(Upstream::Udp(addr))
@@ -303,19 +317,27 @@ pub(crate) async fn forward_tcp(
     upstream: SocketAddr,
     timeout_duration: Duration,
 ) -> Result<DnsPacket> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
     let mut send_buffer = BytePacketBuffer::new();
     query.write(&mut send_buffer)?;
-    let msg = send_buffer.filled();
+    let data = forward_tcp_raw(send_buffer.filled(), upstream, timeout_duration).await?;
+    let mut recv_buffer = BytePacketBuffer::from_bytes(&data);
+    DnsPacket::from_buffer(&mut recv_buffer)
+}
+
+async fn forward_tcp_raw(
+    wire: &[u8],
+    upstream: SocketAddr,
+    timeout_duration: Duration,
+) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     let mut stream = timeout(timeout_duration, TcpStream::connect(upstream)).await??;
 
     // Single write: Microsoft/Azure DNS servers close TCP connections on split segments
-    let mut outbuf = Vec::with_capacity(2 + msg.len());
-    outbuf.extend_from_slice(&(msg.len() as u16).to_be_bytes());
-    outbuf.extend_from_slice(msg);
+    let mut outbuf = Vec::with_capacity(2 + wire.len());
+    outbuf.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+    outbuf.extend_from_slice(wire);
     stream.write_all(&outbuf).await?;
 
     // Read length-prefixed response
@@ -326,8 +348,7 @@ pub(crate) async fn forward_tcp(
     let mut data = vec![0u8; resp_len];
     timeout(timeout_duration, stream.read_exact(&mut data)).await??;
 
-    let mut recv_buffer = BytePacketBuffer::from_bytes(&data);
-    DnsPacket::from_buffer(&mut recv_buffer)
+    Ok(data)
 }
 
 async fn forward_dot_raw(
@@ -371,6 +392,7 @@ pub async fn forward_query_raw(
 ) -> Result<Vec<u8>> {
     match upstream {
         Upstream::Udp(addr) => forward_udp_raw(wire, *addr, timeout_duration).await,
+        Upstream::Tcp(addr) => forward_tcp_raw(wire, *addr, timeout_duration).await,
         Upstream::Doh { url, client } => forward_doh_raw(wire, url, client, timeout_duration).await,
         Upstream::Dot {
             addr,
@@ -481,8 +503,10 @@ pub async fn forward_with_failover_raw(
     };
     candidates.sort_by_key(|&(_, rtt)| rtt);
 
+    let has_fallback = !pool.fallback.is_empty();
     let all_upstreams: Vec<&Upstream> = candidates
         .iter()
+        .filter(|&&(_, rtt)| !has_fallback || rtt < crate::srtt::PRIMARY_SKIP_SRTT_MS)
         .map(|&(i, _)| &pool.primary[i])
         .chain(pool.fallback.iter())
         .collect();
@@ -603,6 +627,12 @@ mod tests {
             client: reqwest::Client::new(),
         };
         assert_eq!(u.to_string(), "https://dns.quad9.net/dns-query");
+    }
+
+    #[test]
+    fn upstream_display_tcp() {
+        let u = Upstream::Tcp("9.9.9.9:53".parse().unwrap());
+        assert_eq!(u.to_string(), "tcp://9.9.9.9:53");
     }
 
     fn make_query() -> DnsPacket {
@@ -743,6 +773,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_tcp_scheme_default_port() {
+        let u = parse_upstream("tcp://1.2.3.4", 53, None).unwrap();
+        assert_eq!(u, Upstream::Tcp("1.2.3.4:53".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_tcp_scheme_explicit_port() {
+        let u = parse_upstream("tcp://1.2.3.4:5353", 53, None).unwrap();
+        assert_eq!(u, Upstream::Tcp("1.2.3.4:5353".parse().unwrap()));
+    }
+
+    #[test]
     fn pool_label_single() {
         let pool = UpstreamPool::new(vec![Upstream::Udp("1.2.3.4:53".parse().unwrap())], vec![]);
         assert_eq!(pool.label(), "1.2.3.4:53");
@@ -755,6 +797,87 @@ mod tests {
             vec![Upstream::Udp("8.8.8.8:53".parse().unwrap())],
         );
         assert_eq!(pool.label(), "1.2.3.4:53 (+1 more)");
+    }
+
+    #[tokio::test]
+    async fn failover_skips_bad_srtt_primary_when_fallback_exists() {
+        // UDP primary's SRTT is pre-pinned at FAILURE_PENALTY. With a
+        // fallback present, the failover loop should skip the primary
+        // entirely (no UDP timeout cost) and go straight to fallback.
+        let query = make_query();
+        let response_bytes = to_wire(&make_response(&query));
+
+        let app = axum::Router::new().route(
+            "/dns-query",
+            axum::routing::post(move || {
+                let body = response_bytes.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/dns-message")],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let bad_udp_addr: SocketAddr = "192.0.2.99:53".parse().unwrap();
+        let pool = UpstreamPool::new(
+            vec![Upstream::Udp(bad_udp_addr)],
+            vec![Upstream::Doh {
+                url: format!("http://{}/dns-query", doh_addr),
+                client: reqwest::Client::new(),
+            }],
+        );
+
+        let srtt = RwLock::new(SrttCache::new(true));
+        srtt.write().unwrap().record_failure(bad_udp_addr.ip());
+
+        let wire = to_wire(&query);
+        let start = Instant::now();
+        let resp_wire = forward_with_failover_raw(
+            &wire,
+            &pool,
+            &srtt,
+            // High primary timeout — if the circuit-breaker fails to skip,
+            // the test would block ~500ms on the unreachable UDP primary.
+            Duration::from_millis(500),
+            Duration::ZERO,
+        )
+        .await
+        .expect("should fall through to DoH fallback");
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "primary was attempted, elapsed={:?}",
+            start.elapsed()
+        );
+
+        let mut buf = BytePacketBuffer::from_bytes(&resp_wire);
+        let result = DnsPacket::from_buffer(&mut buf).unwrap();
+        assert_eq!(result.header.id, 0xABCD);
+    }
+
+    #[tokio::test]
+    async fn failover_tries_bad_srtt_primary_when_no_fallback() {
+        // No fallback means the circuit-breaker must NOT skip the only
+        // upstream — better to try and fail with a timeout than to error
+        // out without sending a single query.
+        let bad_udp_addr: SocketAddr = "192.0.2.99:53".parse().unwrap();
+        let pool = UpstreamPool::new(vec![Upstream::Udp(bad_udp_addr)], vec![]);
+        let srtt = RwLock::new(SrttCache::new(true));
+        srtt.write().unwrap().record_failure(bad_udp_addr.ip());
+
+        let result = forward_with_failover_raw(
+            &[0u8; 12],
+            &pool,
+            &srtt,
+            Duration::from_millis(50),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

@@ -595,11 +595,23 @@ async fn resolve_upstream_pool(
                 config.upstream.port,
                 Some(bootstrap_resolver.clone()),
             )?;
-            let fallback = parse_upstream_list(
+            let mut fallback = parse_upstream_list(
                 &config.upstream.fallback,
                 config.upstream.port,
                 Some(bootstrap_resolver.clone()),
             )?;
+
+            // Pair every UDP primary with a TCP sibling in fallback so
+            // Forward mode survives carriers that drop outbound UDP:53
+            // for amplification mitigation (BCP 38).
+            for u in &primary {
+                if let crate::forward::Upstream::Udp(addr) = u {
+                    let tcp = crate::forward::Upstream::Tcp(*addr);
+                    if !fallback.contains(&tcp) {
+                        fallback.push(tcp);
+                    }
+                }
+            }
 
             let pool = UpstreamPool::new(primary, fallback);
             let label = pool.label();
