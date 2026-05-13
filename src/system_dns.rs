@@ -526,131 +526,74 @@ fn discover_windows() -> SystemDnsInfo {
     }
 }
 
-#[cfg(any(windows, test))]
-#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
-struct WindowsInterfaceDns {
-    // Passed to netsh's [name=] slot since friendly names fail with
-    // ERROR_INVALID_NAME on non-English locales (#160). Resolved live at
-    // restore time — ifIndex isn't stable across reboots.
-    #[serde(default, skip_serializing)]
-    if_index: u32,
-    servers: Vec<String>,
-}
-
-// PowerShell snippet that emits a JSON object keyed by adapter friendly name.
-// Locale-invariant: cmdlet property names don't translate, unlike the
-// `ipconfig /all` text we used to scrape — non-English Windows installs
-// matched zero adapter headers and `numa install` aborted with "no active
-// network interfaces found" (issue #146).
 #[cfg(windows)]
-const ENUMERATE_INTERFACES_PS: &str = r#"
-$ErrorActionPreference = 'Stop'
-$result = [ordered]@{}
-$adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
-foreach ($a in $adapters) {
-    $v4 = @(Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
-    $v6 = @(Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv6 -ErrorAction SilentlyContinue).ServerAddresses
-    # Drop nulls: ServerAddresses can be $null when an adapter has no
-    # configured DNS for one family, and `$v4 + $null` appends a literal
-    # null entry that ConvertTo-Json emits as JSON `null`, breaking the
-    # `Vec<String>` deserialize on the Rust side.
-    $result[$a.Name] = @{ if_index = $a.ifIndex; servers = @(($v4 + $v6) | Where-Object { $_ }) }
-}
-$result | ConvertTo-Json -Compress -Depth 4
-"#;
-
-#[cfg(any(windows, test))]
-fn parse_powershell_interfaces(
-    json: &str,
-) -> Result<std::collections::HashMap<String, WindowsInterfaceDns>, String> {
-    let trimmed = json.trim();
-    if trimmed.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    serde_json::from_str(trimmed).map_err(|e| format!("invalid powershell JSON: {}", e))
-}
-
-#[cfg(windows)]
-fn get_windows_interfaces() -> Result<std::collections::HashMap<String, WindowsInterfaceDns>, String>
-{
-    let output = std::process::Command::new("powershell")
+fn run_powershell(script: &str, what: &str) -> Result<(), String> {
+    let out = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            ENUMERATE_INTERFACES_PS,
+            script,
         ])
         .output()
-        .map_err(|e| format!("failed to run powershell: {}", e))?;
-    if !output.status.success() {
+        .map_err(|e| format!("failed to run powershell for {}: {}", what, e))?;
+    if !out.status.success() {
         return Err(format!(
-            "powershell adapter query failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{} failed: {}",
+            what,
+            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    parse_powershell_interfaces(&String::from_utf8_lossy(&output.stdout))
+    Ok(())
 }
 
+/// Idempotent: any prior rule pointing at our loopback IP is removed first.
 #[cfg(windows)]
-fn windows_backup_path() -> std::path::PathBuf {
-    // Use ProgramData (not APPDATA) since install requires admin elevation
-    // and APPDATA differs between user and admin contexts.
-    std::path::PathBuf::from(
-        std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into()),
-    )
-    .join("numa")
-    .join("original-dns.json")
+fn install_nrpt_rule() -> Result<(), String> {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Get-DnsClientNrptRule | Where-Object {{ $_.NameServers -contains '{ip}' }} |
+    ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}
+Add-DnsClientNrptRule -Namespace '.' -NameServers '{ip}' | Out-Null
+"#,
+        ip = crate::config::NUMA_LOOPBACK_IP
+    );
+    run_powershell(&script, "install NRPT rule")
 }
 
+/// Best-effort: never blocks uninstall.
 #[cfg(windows)]
-fn disable_dnscache() -> Result<bool, String> {
-    // Check if Dnscache is running (it can hold port 53)
-    let output = std::process::Command::new("sc")
-        .args(["query", "Dnscache"])
-        .output()
-        .map_err(|e| format!("failed to query Dnscache: {}", e))?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    if !text.contains("RUNNING") {
-        return Ok(false);
-    }
-
-    eprintln!("  Disabling DNS Client (Dnscache) to free port 53...");
-    // Dnscache can't be stopped via sc/net stop — must disable via registry
-    let status = std::process::Command::new("reg")
-        .args([
-            "add",
-            "HKLM\\SYSTEM\\CurrentControlSet\\Services\\Dnscache",
-            "/v",
-            "Start",
-            "/t",
-            "REG_DWORD",
-            "/d",
-            "4",
-            "/f",
-        ])
-        .status()
-        .map_err(|e| format!("failed to disable Dnscache: {}", e))?;
-
-    if !status.success() {
-        return Err("failed to disable Dnscache via registry (run as Administrator?)".into());
-    }
-
-    // Dnscache is disabled for next boot. Check whether port 53 is
-    // actually blocked right now — on many Windows configurations
-    // Dnscache doesn't bind port 53 even while running.
-    let port_blocked = std::net::UdpSocket::bind("127.0.0.1:53").is_err();
-    if port_blocked {
-        eprintln!("  Dnscache disabled. A reboot is required to free port 53.");
-    } else {
-        eprintln!("  Dnscache disabled. Port 53 is free.");
-    }
-    Ok(port_blocked)
+fn remove_nrpt_rule() {
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Get-DnsClientNrptRule | Where-Object {{ $_.NameServers -contains '{ip}' }} |
+    ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}
+"#,
+        ip = crate::config::NUMA_LOOPBACK_IP
+    );
+    let _ = run_powershell(&script, "remove NRPT rule");
 }
 
+/// One-shot unwinder for the pre-2026 install layout (Dnscache disabled +
+/// adapter DNS pinned at 127.0.0.1). Resets each adapter listed in the legacy
+/// backup to DHCP by friendly name — netsh accepts names for adapters that
+/// aren't Up, so this recovers a Wi-Fi adapter even when the Dnscache-disable
+/// cascade has hidden it from `Get-NetAdapter`.
 #[cfg(windows)]
-fn enable_dnscache() {
+fn unwind_legacy_install_if_present() {
+    let backup_path = crate::data_dir().join("original-dns.json");
+    let Ok(json) = std::fs::read_to_string(&backup_path) else {
+        return;
+    };
+
+    eprintln!("  Unwinding legacy install (adapter-DNS pinning, Dnscache disabled)...");
+
+    // Re-enable Dnscache (registry Start=2 = auto) before anything else —
+    // the Wlansvc/Wcmsvc cascade can't recover until Dnscache is startable.
     let _ = std::process::Command::new("reg")
         .args([
             "add",
@@ -664,197 +607,63 @@ fn enable_dnscache() {
             "/f",
         ])
         .status();
-}
 
-/// True if the backup map has at least one real upstream (non-loopback, non-stub).
-#[cfg(any(windows, test))]
-fn backup_has_real_upstream_windows(
-    interfaces: &std::collections::HashMap<String, WindowsInterfaceDns>,
-) -> bool {
-    interfaces
-        .values()
-        .any(|iface| iface.servers.iter().any(|s| !is_loopback_or_stub(s)))
-}
-
-#[cfg(any(windows, test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddressFamily {
-    V4,
-    V6,
-}
-
-#[cfg(windows)]
-impl AddressFamily {
-    fn netsh_arg(self) -> &'static str {
-        match self {
-            AddressFamily::V4 => "ipv4",
-            AddressFamily::V6 => "ipv6",
+    // Static-DNS users lose their explicit servers and revert to DHCP.
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(&json) {
+        for name in obj.keys() {
+            let name_arg = format!("name={}", name);
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "dnsservers",
+                    &name_arg,
+                    "source=dhcp",
+                ])
+                .status();
+            eprintln!("  reset DNS for \"{}\" -> DHCP", name);
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            AddressFamily::V4 => "IPv4",
-            AddressFamily::V6 => "IPv6",
-        }
-    }
-}
-
-#[cfg(any(windows, test))]
-#[derive(Debug, PartialEq, Eq)]
-struct RestorePlan {
-    name: String,
-    if_index: u32,
-    family: AddressFamily,
-    servers: Vec<String>,
-}
-
-#[cfg(any(windows, test))]
-fn plan_windows_restore(
-    backup: &std::collections::HashMap<String, WindowsInterfaceDns>,
-    live: &std::collections::HashMap<String, WindowsInterfaceDns>,
-) -> (Vec<RestorePlan>, Vec<String>) {
-    let mut plans = Vec::new();
-    let mut missing = Vec::new();
-    let mut names: Vec<&String> = backup.keys().collect();
-    names.sort();
-    for name in names {
-        let Some(live_iface) = live.get(name) else {
-            missing.push(name.clone());
-            continue;
-        };
-        let if_index = live_iface.if_index;
-        let servers = &backup[name].servers;
-        // v6 emission gates on the *unfiltered* backup having any v6 entries —
-        // even the fec0:0:0:ffff::1/2/3 stubs count, since they're returned
-        // only when v6 is enabled on the adapter. No v6 entries at all
-        // means v6 was disabled, and `netsh interface ipv6 set ... dhcp`
-        // would error on disabled adapters.
-        let v6_was_enabled = servers
-            .iter()
-            .any(|s| s.parse::<std::net::Ipv6Addr>().is_ok());
-        let (v4, v6): (Vec<String>, Vec<String>) = servers
-            .iter()
-            .filter(|s| !is_loopback_or_stub(s))
-            .cloned()
-            .partition(|s| s.parse::<std::net::Ipv4Addr>().is_ok());
-        plans.push(RestorePlan {
-            name: name.clone(),
-            if_index,
-            family: AddressFamily::V4,
-            servers: v4,
-        });
-        if v6_was_enabled {
-            plans.push(RestorePlan {
-                name: name.clone(),
-                if_index,
-                family: AddressFamily::V6,
-                servers: v6,
-            });
-        }
-    }
-    (plans, missing)
-}
-
-/// Capture pre-numa DNS state for `uninstall` to restore. Returns `Ok(true)`
-/// when a fresh backup was written; `Ok(false)` when an existing useful
-/// backup was preserved (re-install on numa-managed state).
-#[cfg(windows)]
-fn write_windows_backup(
-    path: &std::path::Path,
-    interfaces: &mut std::collections::HashMap<String, WindowsInterfaceDns>,
-) -> Result<bool, String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
-    }
-
-    // Preserve an existing useful backup rather than overwriting it with
-    // numa-managed state (which would be self-referential after uninstall).
-    let existing: Option<std::collections::HashMap<String, WindowsInterfaceDns>> =
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|json| serde_json::from_str(&json).ok());
-    let has_useful_existing = existing
-        .as_ref()
-        .map(backup_has_real_upstream_windows)
-        .unwrap_or(false);
-
-    if has_useful_existing {
-        eprintln!("  Existing DNS backup preserved at {}", path.display());
-        return Ok(false);
-    }
-
-    // Filter loopback/stub addresses before saving so a fresh backup
-    // captured from already-numa-managed state isn't self-referential.
-    for iface in interfaces.values_mut() {
-        iface.servers.retain(|s| !is_loopback_or_stub(s));
-    }
-    let json = serde_json::to_string_pretty(&interfaces)
-        .map_err(|e| format!("failed to serialize backup: {}", e))?;
-    std::fs::write(path, json).map_err(|e| format!("failed to write backup: {}", e))?;
-    Ok(true)
+    let _ = std::fs::remove_file(&backup_path);
+    eprintln!("  Reboot recommended to fully restart the Dnscache -> Wlansvc dependency chain.");
 }
 
 #[cfg(windows)]
 fn install_windows(skip_system_dns: bool) -> Result<(), String> {
-    let mut interfaces = get_windows_interfaces()?;
-    if interfaces.is_empty() {
-        return Err("no active network interfaces found".to_string());
-    }
-
-    let path = windows_backup_path();
-    let wrote_fresh_backup = if skip_system_dns {
-        false
-    } else {
-        write_windows_backup(&path, &mut interfaces)?
-    };
-
-    // On re-install, stop the running service first so the binary can be
-    // overwritten and port 53 is released for the Dnscache probe.
     if is_service_registered() {
         eprintln!("  Stopping existing service...");
         stop_service_scm();
     }
 
-    let needs_reboot = disable_dnscache()?;
+    unwind_legacy_install_if_present();
 
-    // Copy the binary to a stable path under ProgramData and register it
-    // as a real Windows service (SCM-managed, boot-time, auto-restart).
     let service_exe = install_service_binary()?;
     register_service_scm(&service_exe)?;
 
-    if needs_reboot {
-        // Dnscache still holds port 53 until reboot. Do NOT redirect DNS
-        // yet — nothing is listening on 127.0.0.1:53, so redirecting now
-        // would kill DNS. The service will call redirect_dns_to_localhost()
-        // on its first startup after reboot.
-    } else {
-        if !skip_system_dns {
-            redirect_dns_with_interfaces(&interfaces)?;
-        }
+    if !skip_system_dns {
+        install_nrpt_rule()?;
+        eprintln!(
+            "  NRPT rule installed: all DNS routed through numa ({}).",
+            crate::config::NUMA_LOOPBACK_IP
+        );
+    }
 
-        match start_service_scm() {
-            Ok(_) => eprintln!("  Service started."),
-            Err(e) => eprintln!(
-                "  warning: service registered but could not start now: {}",
-                e
-            ),
-        }
+    match start_service_scm() {
+        Ok(_) => eprintln!("  Service started."),
+        Err(e) => eprintln!(
+            "  warning: service registered but could not start now: {}",
+            e
+        ),
     }
 
     eprintln!();
     if skip_system_dns {
         eprintln!("{}", SKIP_DNS_NOTICE);
-    } else if wrote_fresh_backup {
-        eprintln!("  Original DNS saved to {}", path.display());
     }
-    eprintln!("  Run 'numa uninstall' to restore.\n");
-    if needs_reboot {
-        eprintln!("  *** Reboot required. Numa will start automatically. ***\n");
-    } else {
-        eprintln!("  Numa is running.\n");
-    }
+    eprintln!("  Run 'numa uninstall' to remove.\n");
+    eprintln!("  Numa is running.\n");
     print_recursive_hint();
     Ok(())
 }
@@ -877,127 +686,6 @@ fn run_sc(args: &[&str]) -> Result<std::process::Output, String> {
         .output()
         .map_err(|e| format!("failed to run sc {}: {}", args.first().unwrap_or(&""), e))?;
     Ok(out)
-}
-
-/// Point all active network interfaces at 127.0.0.1 so Numa handles DNS.
-/// Called from the service on first boot after a reboot that freed Dnscache.
-#[cfg(windows)]
-pub fn redirect_dns_to_localhost() -> Result<(), String> {
-    let interfaces = get_windows_interfaces()?;
-    redirect_dns_with_interfaces(&interfaces)
-}
-
-#[cfg(windows)]
-fn run_netsh(family: AddressFamily, args: &[&str]) -> std::io::Result<std::process::ExitStatus> {
-    std::process::Command::new("netsh")
-        .arg("interface")
-        .arg(family.netsh_arg())
-        .args(args)
-        .status()
-}
-
-#[cfg(windows)]
-fn redirect_dns_with_interfaces(
-    interfaces: &std::collections::HashMap<String, WindowsInterfaceDns>,
-) -> Result<(), String> {
-    for (name, iface) in interfaces {
-        let idx = iface.if_index.to_string();
-        let status = run_netsh(
-            AddressFamily::V4,
-            &["set", "dnsservers", &idx, "static", "127.0.0.1", "primary"],
-        )
-        .map_err(|e| format!("failed to set DNS for {}: {}", name, e))?;
-
-        if status.success() {
-            eprintln!("  set DNS for \"{}\" -> 127.0.0.1", name);
-        } else {
-            eprintln!(
-                "  warning: failed to set DNS for \"{}\" (run as Administrator?)",
-                name
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-impl RestorePlan {
-    fn apply(&self) -> Result<String, String> {
-        let idx = self.if_index.to_string();
-        match self.servers.split_first() {
-            Some((primary, rest)) => self.apply_static(&idx, primary, rest),
-            None => self.apply_dhcp(&idx),
-        }
-    }
-
-    fn apply_static(
-        &self,
-        idx: &str,
-        primary: &str,
-        secondaries: &[String],
-    ) -> Result<String, String> {
-        // validate=no — we trust the backup; validation issues an outbound DNS
-        // probe that fails on UDP-restricted networks (#147) and aborts the set.
-        self.netsh(
-            &[
-                "set",
-                "dnsservers",
-                idx,
-                "static",
-                primary,
-                "primary",
-                "validate=no",
-            ],
-            &format!("set primary {}", primary),
-        )?;
-        for (i, server) in secondaries.iter().enumerate() {
-            let idx_arg = format!("index={}", i + 2);
-            self.netsh(
-                &["add", "dnsservers", idx, server, &idx_arg, "validate=no"],
-                &format!("add {}", server),
-            )?;
-        }
-        let all = std::iter::once(primary)
-            .chain(secondaries.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Ok(format!(
-            "restored {} DNS for \"{}\" -> {}",
-            self.family.label(),
-            self.name,
-            all
-        ))
-    }
-
-    fn apply_dhcp(&self, idx: &str) -> Result<String, String> {
-        self.netsh(&["set", "dnsservers", idx, "dhcp"], "reset")?;
-        Ok(format!(
-            "reset {} DNS for \"{}\" -> DHCP",
-            self.family.label(),
-            self.name
-        ))
-    }
-
-    fn netsh(&self, args: &[&str], action: &str) -> Result<(), String> {
-        let status = run_netsh(self.family, args).map_err(|e| {
-            format!(
-                "failed to {} {} for \"{}\": {}",
-                action,
-                self.family.label(),
-                self.name,
-                e
-            )
-        })?;
-        if !status.success() {
-            return Err(format!(
-                "netsh failed to {} {} for \"{}\"",
-                action,
-                self.family.label(),
-                self.name
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Copy the currently-running binary to the service install location. SCM
@@ -1040,7 +728,8 @@ fn register_service_scm(exe: &std::path::Path) -> Result<(), String> {
     let name = crate::windows_service::SERVICE_NAME;
 
     // sc.exe uses a leading space as its `name= value` delimiter; the space
-    // after `=` is mandatory.
+    // after `=` is mandatory. `depend= Dnscache` closes the boot-order race
+    // where numa starts before the resolver Dnscache routes queries to it.
     let create = run_sc(&[
         "create",
         name,
@@ -1052,6 +741,8 @@ fn register_service_scm(exe: &std::path::Path) -> Result<(), String> {
         "auto",
         "obj=",
         "LocalSystem",
+        "depend=",
+        "Dnscache",
     ])?;
     if !create.status.success() {
         let out = String::from_utf8_lossy(&create.stdout);
@@ -1170,74 +861,13 @@ fn parse_sc_state(sc_output: &str) -> String {
 
 #[cfg(windows)]
 fn uninstall_windows() -> Result<(), String> {
-    // Stop + remove the service before touching DNS, so port 53 is released
-    // cleanly and the failure-restart policy doesn't resurrect it.
     stop_service_scm();
     delete_service_scm();
     remove_service_binary();
-    let path = windows_backup_path();
-    let json = match std::fs::read_to_string(&path) {
-        Ok(j) => j,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Install was --no-system-dns (or backup never written): there
-            // is nothing to restore. Still re-enable Dnscache so the host
-            // is back to a stock configuration.
-            enable_dnscache();
-            eprintln!("  No system DNS backup found — system DNS was not managed by numa.");
-            eprintln!("  DNS Client re-enabled. Reboot to fully restore the DNS Client service.\n");
-            return Ok(());
-        }
-        Err(e) => {
-            return Err(format!(
-                "failed to read backup at {}: {}",
-                path.display(),
-                e
-            ))
-        }
-    };
-    let original: std::collections::HashMap<String, WindowsInterfaceDns> =
-        serde_json::from_str(&json).map_err(|e| format!("invalid backup file: {}", e))?;
+    remove_nrpt_rule();
+    unwind_legacy_install_if_present();
 
-    let live = get_windows_interfaces()?;
-    let (plan, skipped) = plan_windows_restore(&original, &live);
-
-    for name in &skipped {
-        eprintln!("  warning: adapter \"{}\" not currently up; skipped", name);
-    }
-    let mut apply_failed = false;
-    for action in &plan {
-        match action.apply() {
-            Ok(msg) => eprintln!("  {}", msg),
-            Err(e) => {
-                eprintln!("  warning: {}", e);
-                apply_failed = true;
-            }
-        }
-    }
-
-    // Keep the backup if anything went wrong — adapter offline (re-runnable
-    // after reconnect) or netsh non-zero exit (re-runnable after manual
-    // diagnosis). Removing it would leave the registry pinned at 127.0.0.1
-    // with no recovery state.
-    enable_dnscache();
-    if skipped.is_empty() && !apply_failed {
-        std::fs::remove_file(&path).ok();
-        eprintln!("\n  System DNS restored. DNS Client re-enabled.");
-    } else if !skipped.is_empty() {
-        eprintln!(
-            "\n  Partial restore. Backup kept at {} — re-run 'numa uninstall' after reconnecting: {}",
-            path.display(),
-            skipped.join(", ")
-        );
-        eprintln!("  DNS Client re-enabled.");
-    } else {
-        eprintln!(
-            "\n  Partial restore. Backup kept at {} — check the warnings above and re-run 'numa uninstall'.",
-            path.display()
-        );
-        eprintln!("  DNS Client re-enabled.");
-    }
-    eprintln!("  Reboot to fully restore the DNS Client service.\n");
+    eprintln!("\n  Numa uninstalled. NRPT rule removed; Dnscache unchanged.\n");
     Ok(())
 }
 
@@ -2367,64 +1997,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_powershell_servers() {
-        // Shape emitted by ENUMERATE_INTERFACES_PS — adapter name keys, each
-        // value carries the live ifIndex and a merged IPv4+IPv6 server list.
-        // Legacy `dhcp` field (in pre-fix backups on disk) is silently
-        // ignored on read.
-        let sample = r#"{"Ethernet":{"if_index":12,"servers":["8.8.8.8","8.8.4.4"]},"Wi-Fi":{"dhcp":true,"if_index":7,"servers":["1.1.1.1"]}}"#;
-        let result = parse_powershell_interfaces(sample).expect("parse failed");
-        assert_eq!(result.len(), 2);
-        assert_eq!(
-            result["Ethernet"],
-            WindowsInterfaceDns {
-                if_index: 12,
-                servers: vec!["8.8.8.8".into(), "8.8.4.4".into()],
-            }
-        );
-        assert_eq!(
-            result["Wi-Fi"],
-            WindowsInterfaceDns {
-                if_index: 7,
-                servers: vec!["1.1.1.1".into()],
-            }
-        );
-    }
-
-    #[test]
-    fn parse_powershell_legacy_backup_without_if_index() {
-        let sample = r#"{"Ethernet":{"servers":["8.8.8.8"]}}"#;
-        let result = parse_powershell_interfaces(sample).expect("parse failed");
-        assert_eq!(result["Ethernet"].if_index, 0);
-        assert_eq!(result["Ethernet"].servers, vec!["8.8.8.8".to_string()]);
-    }
-
-    #[test]
-    fn parse_powershell_empty_when_no_adapters_up() {
-        // Get-NetAdapter | Where Status=Up returns nothing → empty hashtable
-        // → ConvertTo-Json emits "{}". Must produce an empty map, not error,
-        // so install_windows() can surface the right "no active interfaces"
-        // message instead of a JSON parse failure.
-        assert!(parse_powershell_interfaces("{}").unwrap().is_empty());
-        assert!(parse_powershell_interfaces("").unwrap().is_empty());
-        assert!(parse_powershell_interfaces("   \n").unwrap().is_empty());
-    }
-
-    #[test]
-    fn parse_powershell_rejects_garbage() {
-        assert!(parse_powershell_interfaces("not json").is_err());
-    }
-
-    #[test]
-    fn parse_powershell_rejects_null_server_entry() {
-        // Locks in the PS-side null filter (Where-Object { $_ }) — a real
-        // install on a dual-stack adapter without IPv6 DNS used to emit
-        // `["10.0.0.1", null]`, failing deserialize at install time.
-        let sample = r#"{"Wi-Fi":{"servers":["1.1.1.1",null]}}"#;
-        assert!(parse_powershell_interfaces(sample).is_err());
-    }
-
-    #[test]
     fn install_templates_contain_exe_path_placeholder() {
         // Both files are substituted at install time — plist via
         // replace_exe_path on macOS, numa.service via inline .replace
@@ -2462,188 +2034,6 @@ mod tests {
         // One real entry → useful
         map.insert("Tailscale".into(), vec!["192.168.1.1".into()]);
         assert!(backup_has_real_upstream_macos(&map));
-    }
-
-    #[test]
-    fn windows_backup_filters_loopback() {
-        use std::collections::HashMap;
-        let mut map: HashMap<String, WindowsInterfaceDns> = HashMap::new();
-
-        // Empty backup → no real upstream
-        assert!(!backup_has_real_upstream_windows(&map));
-
-        // All-loopback backup → still no real upstream (the bug case)
-        map.insert(
-            "Wi-Fi".into(),
-            WindowsInterfaceDns {
-                servers: vec!["127.0.0.1".into()],
-                if_index: 0,
-            },
-        );
-        map.insert(
-            "Ethernet".into(),
-            WindowsInterfaceDns {
-                servers: vec!["::1".into(), "0.0.0.0".into()],
-                if_index: 0,
-            },
-        );
-        assert!(!backup_has_real_upstream_windows(&map));
-
-        // fec0:0:0:ffff::1/2/3 leak into every VPN/virtual adapter via
-        // Get-DnsClientServerAddress.
-        map.insert(
-            "Tailscale".into(),
-            WindowsInterfaceDns {
-                servers: vec![
-                    "fec0:0:0:ffff::1".into(),
-                    "fec0:0:0:ffff::2".into(),
-                    "fec0:0:0:ffff::3".into(),
-                ],
-                if_index: 0,
-            },
-        );
-        assert!(!backup_has_real_upstream_windows(&map));
-
-        // One real entry alongside loopback → useful
-        map.insert(
-            "Ethernet 2".into(),
-            WindowsInterfaceDns {
-                servers: vec!["192.168.1.1".into()],
-                if_index: 0,
-            },
-        );
-        assert!(backup_has_real_upstream_windows(&map));
-    }
-
-    fn iface(if_index: u32, servers: &[&str]) -> WindowsInterfaceDns {
-        WindowsInterfaceDns {
-            if_index,
-            servers: servers.iter().map(|s| (*s).to_string()).collect(),
-        }
-    }
-
-    fn plan(name: &str, if_index: u32, family: AddressFamily, servers: &[&str]) -> RestorePlan {
-        RestorePlan {
-            name: name.into(),
-            if_index,
-            family,
-            servers: servers.iter().map(|s| (*s).to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn plan_restore_splits_v4_and_v6_families() {
-        let mut backup = std::collections::HashMap::new();
-        backup.insert(
-            "Ethernet".into(),
-            iface(
-                0,
-                &[
-                    "8.8.8.8",
-                    "1.1.1.1",
-                    "2001:4860:4860::8888",
-                    "2606:4700:4700::1111",
-                ],
-            ),
-        );
-        let mut live = std::collections::HashMap::new();
-        live.insert("Ethernet".into(), iface(12, &[]));
-
-        assert_eq!(
-            plan_windows_restore(&backup, &live),
-            (
-                vec![
-                    plan("Ethernet", 12, AddressFamily::V4, &["8.8.8.8", "1.1.1.1"]),
-                    plan(
-                        "Ethernet",
-                        12,
-                        AddressFamily::V6,
-                        &["2001:4860:4860::8888", "2606:4700:4700::1111"],
-                    ),
-                ],
-                vec![],
-            ),
-        );
-    }
-
-    #[test]
-    fn plan_restore_returns_missing_adapter_names() {
-        let mut backup = std::collections::HashMap::new();
-        backup.insert("Tailscale".into(), iface(0, &["100.100.100.100"]));
-        let live = std::collections::HashMap::new();
-
-        assert_eq!(
-            plan_windows_restore(&backup, &live),
-            (vec![], vec!["Tailscale".into()]),
-        );
-    }
-
-    #[test]
-    fn plan_restore_skips_v6_when_disabled_in_backup() {
-        let mut backup = std::collections::HashMap::new();
-        backup.insert("Ethernet".into(), iface(0, &["192.168.1.1"]));
-        let mut live = std::collections::HashMap::new();
-        live.insert("Ethernet".into(), iface(12, &[]));
-
-        assert_eq!(
-            plan_windows_restore(&backup, &live),
-            (
-                vec![plan("Ethernet", 12, AddressFamily::V4, &["192.168.1.1"])],
-                vec![],
-            ),
-        );
-    }
-
-    #[test]
-    fn plan_restore_emits_v6_dhcp_when_only_v6_stubs_in_backup() {
-        let mut backup = std::collections::HashMap::new();
-        backup.insert(
-            "Ethernet".into(),
-            iface(0, &["192.168.1.1", "fec0:0:0:ffff::1"]),
-        );
-        let mut live = std::collections::HashMap::new();
-        live.insert("Ethernet".into(), iface(12, &[]));
-
-        assert_eq!(
-            plan_windows_restore(&backup, &live),
-            (
-                vec![
-                    plan("Ethernet", 12, AddressFamily::V4, &["192.168.1.1"]),
-                    plan("Ethernet", 12, AddressFamily::V6, &[]),
-                ],
-                vec![],
-            ),
-        );
-    }
-
-    #[test]
-    fn plan_restore_filters_loopback_and_stub_addresses() {
-        let mut backup = std::collections::HashMap::new();
-        backup.insert(
-            "Ethernet".into(),
-            iface(
-                0,
-                &[
-                    "127.0.0.1",
-                    "8.8.8.8",
-                    "fec0:0:0:ffff::1",
-                    "2001:4860:4860::8888",
-                ],
-            ),
-        );
-        let mut live = std::collections::HashMap::new();
-        live.insert("Ethernet".into(), iface(12, &[]));
-
-        assert_eq!(
-            plan_windows_restore(&backup, &live),
-            (
-                vec![
-                    plan("Ethernet", 12, AddressFamily::V4, &["8.8.8.8"]),
-                    plan("Ethernet", 12, AddressFamily::V6, &["2001:4860:4860::8888"]),
-                ],
-                vec![],
-            ),
-        );
     }
 
     #[test]

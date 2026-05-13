@@ -124,8 +124,16 @@ fn default_api_bind_addr() -> String {
     "127.0.0.1".to_string()
 }
 
+/// On Windows, Dnscache owns 127.0.0.1:53; numa lives on this address and an
+/// NRPT rule routes Dnscache → numa.
+#[cfg(windows)]
+pub const NUMA_LOOPBACK_IP: &str = "127.0.0.2";
+
 fn default_bind_addr() -> String {
-    "0.0.0.0:53".to_string()
+    #[cfg(windows)]
+    return format!("{}:53", NUMA_LOOPBACK_IP);
+    #[cfg(not(windows))]
+    return "0.0.0.0:53".to_string();
 }
 
 pub const DEFAULT_API_PORT: u16 = 5380;

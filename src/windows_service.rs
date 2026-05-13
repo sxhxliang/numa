@@ -61,7 +61,7 @@ fn run_service() -> windows_service::Result<()> {
     // dedicated thread runs the runtime so this function can return cleanly
     // once the SCM tells us to stop — we can't block the dispatcher thread
     // forever without preventing graceful shutdown.
-    let config_path = service_config_path();
+    let config_path = crate::cli_config_path();
     let (server_done_tx, server_done_rx) = mpsc::channel::<()>();
 
     let server_thread = std::thread::spawn(move || {
@@ -82,23 +82,6 @@ fn run_service() -> windows_service::Result<()> {
         }
         let _ = server_done_tx.send(());
     });
-
-    // Wait for the API to be ready, then ensure DNS points at localhost.
-    // On first boot after install (Dnscache was disabled, reboot freed
-    // port 53), the installer deferred the DNS redirect — do it now.
-    let api_up = (0..20).any(|i| {
-        if i > 0 {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        std::net::TcpStream::connect(("127.0.0.1", crate::config::DEFAULT_API_PORT)).is_ok()
-    });
-    if api_up {
-        if let Err(e) = crate::system_dns::redirect_dns_to_localhost() {
-            log::warn!("could not redirect DNS to localhost: {}", e);
-        }
-    } else {
-        log::error!("numa API did not start within 10s — DNS not redirected");
-    }
 
     // Wait for either SCM stop or server termination.
     loop {
@@ -134,14 +117,4 @@ fn run_service() -> windows_service::Result<()> {
 /// will hang here waiting for an SCM that isn't talking to them.
 pub fn run_as_service() -> windows_service::Result<()> {
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
-}
-
-/// Path to the config file used when running under SCM. SCM launches the
-/// service with SYSTEM's working directory (usually `C:\Windows\System32`),
-/// so a relative `numa.toml` lookup won't find anything meaningful.
-fn service_config_path() -> String {
-    crate::data_dir()
-        .join("numa.toml")
-        .to_string_lossy()
-        .into_owned()
 }

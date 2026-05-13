@@ -12,6 +12,7 @@ use crate::packet::DnsPacket;
 use crate::question::QueryType;
 use crate::record::DnsRecord;
 use crate::srtt::SrttCache;
+use crate::stats::UpstreamTransport;
 
 const MAX_REFERRAL_DEPTH: u8 = 10;
 const MAX_CNAME_DEPTH: u8 = 8;
@@ -198,7 +199,7 @@ pub(crate) fn resolve_iterative<'a>(
         }
 
         let (mut current_zone, mut ns_addrs) = find_closest_ns(qname, cache, root_hints);
-        srtt.read().unwrap().sort_by_rtt(&mut ns_addrs);
+        srtt.read().unwrap().sort_by_udp_rtt(&mut ns_addrs);
         let mut ns_idx = 0;
 
         for _ in 0..MAX_REFERRAL_DEPTH {
@@ -239,7 +240,7 @@ pub(crate) fn resolve_iterative<'a>(
                 }
                 let mut new_addrs = resolve_ns_addrs_from_glue(&response, &all_ns, cache);
                 if !new_addrs.is_empty() {
-                    srtt.read().unwrap().sort_by_rtt(&mut new_addrs);
+                    srtt.read().unwrap().sort_by_udp_rtt(&mut new_addrs);
                     ns_addrs = new_addrs;
                     ns_idx = 0;
                     continue;
@@ -340,7 +341,7 @@ pub(crate) fn resolve_iterative<'a>(
                 return Err(format!("could not resolve any NS for {}", qname).into());
             }
 
-            srtt.read().unwrap().sort_by_rtt(&mut new_ns_addrs);
+            srtt.read().unwrap().sort_by_udp_rtt(&mut new_ns_addrs);
             ns_addrs = new_ns_addrs;
             ns_idx = 0;
         }
@@ -597,13 +598,17 @@ async fn tcp_with_srtt(
 ) -> crate::Result<DnsPacket> {
     match crate::forward::forward_tcp(query, server, TCP_TIMEOUT).await {
         Ok(resp) => {
-            srtt.write()
-                .unwrap()
-                .record_rtt(server.ip(), start.elapsed().as_millis() as u64, true);
+            srtt.write().unwrap().record_rtt(
+                server.ip(),
+                UpstreamTransport::Tcp,
+                start.elapsed().as_millis() as u64,
+            );
             Ok(resp)
         }
         Err(e) => {
-            srtt.write().unwrap().record_failure(server.ip());
+            srtt.write()
+                .unwrap()
+                .record_failure(server.ip(), UpstreamTransport::Tcp);
             Err(e)
         }
     }
@@ -626,7 +631,10 @@ async fn send_query_hedged(
 
     let primary = servers[0];
     let secondary = servers[1];
-    let primary_known = srtt.read().unwrap().is_known(primary.ip());
+    let primary_known = srtt
+        .read()
+        .unwrap()
+        .is_known(primary.ip(), UpstreamTransport::Udp);
 
     if !primary_known {
         // Cold: fire both simultaneously, first response wins
@@ -670,7 +678,11 @@ async fn send_query_hedged(
         }
     } else {
         // Warm: send to best, hedge after SRTT × 3 if slow
-        let hedge_ms = srtt.read().unwrap().get(primary.ip()) * 3;
+        let hedge_ms = srtt
+            .read()
+            .unwrap()
+            .get(primary.ip(), UpstreamTransport::Udp)
+            * 3;
         let hedge_delay = Duration::from_millis(hedge_ms.max(50));
 
         let fut_a = send_query(qname, qtype, primary, srtt);
@@ -752,8 +764,8 @@ async fn send_query(
             UDP_FAILURES.store(0, Ordering::Release);
             srtt.write().unwrap().record_rtt(
                 server.ip(),
+                UpstreamTransport::Udp,
                 start.elapsed().as_millis() as u64,
-                false,
             );
             Ok(resp)
         }
@@ -770,7 +782,9 @@ async fn send_query(
             }
             // UDP works in general (priming succeeded) but this server timed out.
             // Don't waste another 400ms on TCP — the server is unreachable.
-            srtt.write().unwrap().record_failure(server.ip());
+            srtt.write()
+                .unwrap()
+                .record_failure(server.ip(), UpstreamTransport::Udp);
             Err(e)
         }
     }

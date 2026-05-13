@@ -332,7 +332,10 @@ fn resolve_local(
     None
 }
 
-/// Resolve .numa: remote clients get LAN IP (can't reach 127.0.0.1), local get loopback.
+/// Resolve `.numa` queries:
+///   - locally-registered service → loopback (local client) or LAN IP (remote)
+///   - LAN peer learned via discovery → that peer's actual IP (v4 or v6 native)
+///   - unknown name → NXDOMAIN (never silently sinkhole to loopback)
 fn resolve_proxy_tld(
     query: &DnsPacket,
     src_addr: SocketAddr,
@@ -341,35 +344,49 @@ fn resolve_proxy_tld(
     ctx: &ServerCtx,
 ) -> (DnsPacket, QueryPath, DnssecStatus) {
     let is_remote = !src_addr.ip().is_loopback();
-    let resolve_ip = {
-        let local = ctx.services.lock().unwrap();
-        if local.lookup(qname).is_some() {
-            if is_remote {
-                *ctx.lan_ip.lock().unwrap()
-            } else {
-                std::net::Ipv4Addr::LOCALHOST
-            }
+
+    // Locally-registered service: remote clients get LAN IP (can't reach
+    // 127.0.0.1), local clients get loopback. Keep TTL short so removing a
+    // service stops intercepting that domain quickly even if the client
+    // cached our answer.
+    if ctx.services.lock().unwrap().lookup(qname).is_some() {
+        let v4 = if is_remote {
+            *ctx.lan_ip.lock().unwrap()
         } else {
-            let mut peers = ctx.lan_peers.lock().unwrap();
-            peers
-                .lookup(qname)
-                .and_then(|(ip, _)| match ip {
-                    std::net::IpAddr::V4(v4) => Some(v4),
-                    _ => None,
-                })
-                .unwrap_or(std::net::Ipv4Addr::LOCALHOST)
+            std::net::Ipv4Addr::LOCALHOST
+        };
+        let v6 = if v4 == std::net::Ipv4Addr::LOCALHOST {
+            std::net::Ipv6Addr::LOCALHOST
+        } else {
+            v4.to_ipv6_mapped()
+        };
+        let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
+        resp.answers
+            .push(sinkhole_record(qname, qtype, v4, v6, 30));
+        return (resp, QueryPath::Local, DnssecStatus::Indeterminate);
+    }
+
+    // LAN peer learned via discovery: native v4 (with v4-mapped v6) or native
+    // v6; A query on a v6-only peer → NODATA per RFC 2308.
+    if let Some((ip, _)) = ctx.lan_peers.lock().unwrap().lookup(qname) {
+        let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
+        match (qtype, ip) {
+            (QueryType::AAAA, std::net::IpAddr::V6(v6)) => resp.answers.push(DnsRecord::AAAA {
+                domain: qname.to_string(),
+                addr: v6,
+                ttl: 30,
+            }),
+            (_, std::net::IpAddr::V4(v4)) => {
+                resp.answers
+                    .push(sinkhole_record(qname, qtype, v4, v4.to_ipv6_mapped(), 30))
+            }
+            (_, std::net::IpAddr::V6(_)) => {}
         }
-    };
-    let v6 = if resolve_ip == std::net::Ipv4Addr::LOCALHOST {
-        std::net::Ipv6Addr::LOCALHOST
-    } else {
-        resolve_ip.to_ipv6_mapped()
-    };
-    let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
-    // Keep service-domain answers short-lived so removing a service stops
-    // intercepting that domain quickly even if the client cached our answer.
-    resp.answers
-        .push(sinkhole_record(qname, qtype, resolve_ip, v6, 30));
+        return (resp, QueryPath::Local, DnssecStatus::Indeterminate);
+    }
+
+    // Unknown name in proxy TLD: NXDOMAIN, never silently sinkhole to loopback.
+    let resp = DnsPacket::response_from(query, ResultCode::NXDOMAIN);
     (resp, QueryPath::Local, DnssecStatus::Indeterminate)
 }
 
@@ -815,7 +832,7 @@ fn special_use_response(query: &DnsPacket, qname: &str, qtype: QueryType) -> Dns
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, Mutex};
     use tokio::sync::broadcast;
 
@@ -1341,6 +1358,80 @@ mod tests {
             DnsRecord::A { addr, .. } => assert_eq!(*addr, Ipv4Addr::LOCALHOST),
             other => panic!("expected A record, got {:?}", other),
         }
+    }
+
+    /// Unknown name in the proxy TLD must NXDOMAIN, not silently return
+    /// loopback. Returning loopback for unknown `.numa` names is a footgun:
+    /// typo'd hostnames and stale references end up routing to the resolver
+    /// host instead of failing fast.
+    #[tokio::test]
+    async fn pipeline_tld_proxy_unknown_returns_nxdomain() {
+        let ctx = Arc::new(crate::testutil::test_ctx().await);
+
+        let (resp_a, path_a) = resolve_in_test(&ctx, "no-such-service.numa", QueryType::A).await;
+        assert_eq!(path_a, QueryPath::Local);
+        assert_eq!(resp_a.header.rescode, ResultCode::NXDOMAIN);
+        assert!(resp_a.answers.is_empty());
+
+        let (resp_aaaa, path_aaaa) =
+            resolve_in_test(&ctx, "no-such-service.numa", QueryType::AAAA).await;
+        assert_eq!(path_aaaa, QueryPath::Local);
+        assert_eq!(resp_aaaa.header.rescode, ResultCode::NXDOMAIN);
+        assert!(resp_aaaa.answers.is_empty());
+    }
+
+    /// LAN peer with an IPv4 address: A → native v4, AAAA → v4-mapped v6.
+    #[tokio::test]
+    async fn pipeline_tld_proxy_v4_peer_returns_native_a_and_mapped_aaaa() {
+        let ctx = crate::testutil::test_ctx().await;
+        ctx.lan_peers
+            .lock()
+            .unwrap()
+            .update("10.0.0.5".parse().unwrap(), &[("kiosk.numa".into(), 8080)]);
+        let ctx = Arc::new(ctx);
+
+        let (resp_a, _) = resolve_in_test(&ctx, "kiosk.numa", QueryType::A).await;
+        assert_eq!(resp_a.header.rescode, ResultCode::NOERROR);
+        match &resp_a.answers[0] {
+            DnsRecord::A { addr, .. } => assert_eq!(*addr, Ipv4Addr::new(10, 0, 0, 5)),
+            other => panic!("expected A record, got {:?}", other),
+        }
+
+        let (resp_aaaa, _) = resolve_in_test(&ctx, "kiosk.numa", QueryType::AAAA).await;
+        assert_eq!(resp_aaaa.header.rescode, ResultCode::NOERROR);
+        match &resp_aaaa.answers[0] {
+            DnsRecord::AAAA { addr, .. } => {
+                assert_eq!(*addr, Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped())
+            }
+            other => panic!("expected AAAA record, got {:?}", other),
+        }
+    }
+
+    /// LAN peer with only an IPv6 address: AAAA → native v6, A → NODATA
+    /// (NOERROR with empty answer section, *not* loopback).
+    #[tokio::test]
+    async fn pipeline_tld_proxy_v6_only_peer_native_aaaa_nodata_a() {
+        let v6: Ipv6Addr = "2001:db8::42".parse().unwrap();
+        let ctx = crate::testutil::test_ctx().await;
+        ctx.lan_peers
+            .lock()
+            .unwrap()
+            .update(v6.into(), &[("ipv6host.numa".into(), 22)]);
+        let ctx = Arc::new(ctx);
+
+        let (resp_aaaa, _) = resolve_in_test(&ctx, "ipv6host.numa", QueryType::AAAA).await;
+        assert_eq!(resp_aaaa.header.rescode, ResultCode::NOERROR);
+        match &resp_aaaa.answers[0] {
+            DnsRecord::AAAA { addr, .. } => assert_eq!(*addr, v6),
+            other => panic!("expected AAAA record, got {:?}", other),
+        }
+
+        let (resp_a, _) = resolve_in_test(&ctx, "ipv6host.numa", QueryType::A).await;
+        assert_eq!(resp_a.header.rescode, ResultCode::NOERROR);
+        assert!(
+            resp_a.answers.is_empty(),
+            "v6-only peer + A query must be NODATA, not loopback"
+        );
     }
 
     #[tokio::test]

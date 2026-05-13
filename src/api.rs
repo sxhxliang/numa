@@ -205,6 +205,7 @@ struct TransportStats {
 #[derive(Serialize)]
 struct UpstreamTransportStats {
     udp: u64,
+    tcp: u64,
     doh: u64,
     dot: u64,
     odoh: u64,
@@ -592,6 +593,7 @@ async fn stats(State(ctx): State<Arc<ServerCtx>>) -> Json<StatsResponse> {
         },
         upstream_transport: UpstreamTransportStats {
             udp: snap.upstream_transport_udp,
+            tcp: snap.upstream_transport_tcp,
             doh: snap.upstream_transport_doh,
             dot: snap.upstream_transport_dot,
             odoh: snap.upstream_transport_odoh,
