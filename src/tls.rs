@@ -110,6 +110,13 @@ pub fn build_tls_config(
     Ok(Arc::new(config))
 }
 
+/// Create the CA cert and key on disk if missing. Used by the install path
+/// to materialize `ca.pem` synchronously before trusting it, instead of
+/// racing the service's lazy CA generation on first TLS handshake.
+pub fn ensure_ca_files(dir: &Path) -> crate::Result<()> {
+    ensure_ca(dir).map(|_| ())
+}
+
 fn ensure_ca(dir: &Path) -> crate::Result<(CertificateDer<'static>, Issuer<'static, KeyPair>)> {
     let ca_key_path = dir.join("ca.key");
     let ca_cert_path = dir.join(CA_FILE_NAME);

@@ -33,6 +33,7 @@ pub fn router(ctx: Arc<ServerCtx>) -> Router {
         .route("/overrides/{domain}", get(get_override))
         .route("/overrides/{domain}", delete(remove_override))
         .route("/diagnose/{domain}", get(diagnose))
+        .route("/resolve/{domain}", get(resolve))
         .route("/query-log", get(query_log))
         .route("/stats", get(stats))
         .route("/cache", get(list_cache))
@@ -289,6 +290,20 @@ struct CacheEntryResponse {
     ttl_remaining: u32,
 }
 
+#[derive(Deserialize)]
+struct ResolveParams {
+    r#type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResolveResponse {
+    domain: String,
+    query_type: String,
+    rescode: String,
+    addresses: Vec<String>,
+    ttl: Option<u32>,
+}
+
 // --- Handlers ---
 
 async fn create_overrides(
@@ -486,6 +501,64 @@ async fn forward_query_for_diagnose(
         ),
         Err(e) => (false, format!("error: {}", e)),
     }
+}
+
+async fn resolve(
+    State(ctx): State<Arc<ServerCtx>>,
+    Path(domain): Path<String>,
+    Query(params): Query<ResolveParams>,
+) -> Result<Json<ResolveResponse>, (StatusCode, String)> {
+    let domain_lower = domain.to_lowercase();
+    let qtype = match params.r#type.as_deref() {
+        None => QueryType::A,
+        Some(s) => QueryType::parse_str(s)
+            .ok_or((StatusCode::BAD_REQUEST, format!("unknown query type: {s}")))?,
+    };
+
+    let upstream = ctx
+        .upstream_pool
+        .lock()
+        .unwrap()
+        .preferred()
+        .cloned()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no upstream configured".to_string(),
+        ))?;
+
+    let query = crate::packet::DnsPacket::query(0xBEEF, &domain_lower, qtype);
+    let resp = forward_query(&query, &upstream, ctx.timeout)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let mut ttl: Option<u32> = None;
+    let addresses: Vec<String> = resp
+        .answers
+        .iter()
+        .filter_map(|r| match r {
+            crate::record::DnsRecord::A {
+                addr, ttl: rec_ttl, ..
+            } => {
+                ttl = Some(ttl.map_or(*rec_ttl, |t| t.min(*rec_ttl)));
+                Some(addr.to_string())
+            }
+            crate::record::DnsRecord::AAAA {
+                addr, ttl: rec_ttl, ..
+            } => {
+                ttl = Some(ttl.map_or(*rec_ttl, |t| t.min(*rec_ttl)));
+                Some(addr.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+
+    Ok(Json(ResolveResponse {
+        domain: domain_lower,
+        query_type: qtype.as_str().to_string(),
+        rescode: resp.header.rescode.as_str().to_string(),
+        addresses,
+        ttl,
+    }))
 }
 
 async fn query_log(

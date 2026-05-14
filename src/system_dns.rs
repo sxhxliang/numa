@@ -902,9 +902,21 @@ fn redirect_dns_with_interfaces(
 ) -> Result<(), String> {
     for (name, iface) in interfaces {
         let idx = iface.if_index.to_string();
+        // validate=no — netsh's validation probes 127.0.0.1 before numa is
+        // bound to :53 and also fails on UDP-restricted networks (#147); the
+        // probe just produces a localized warning ("配置的 DNS 服务器不正确
+        // 或不存在") without preventing the set. Matches the restore path.
         let status = run_netsh(
             AddressFamily::V4,
-            &["set", "dnsservers", &idx, "static", "127.0.0.1", "primary"],
+            &[
+                "set",
+                "dnsservers",
+                &idx,
+                "static",
+                "127.0.0.1",
+                "primary",
+                "validate=no",
+            ],
         )
         .map_err(|e| format!("failed to set DNS for {}: {}", name, e))?;
 
@@ -2187,9 +2199,14 @@ fn detect_linux_trust_store() -> Option<&'static LinuxTrustStore> {
 }
 
 fn trust_ca() -> Result<(), String> {
-    let ca_path = crate::data_dir().join(crate::tls::CA_FILE_NAME);
+    let data_dir = crate::data_dir();
+    let ca_path = data_dir.join(crate::tls::CA_FILE_NAME);
     if !ca_path.exists() {
-        return Err("CA not generated yet — start numa first to create certificates".into());
+        // Service was just started by install; it may not have hit the TLS
+        // path yet to lazily create the CA. Generate it ourselves so trust
+        // setup is deterministic — the service will pick up the same files.
+        crate::tls::ensure_ca_files(&data_dir)
+            .map_err(|e| format!("failed to generate CA: {}", e))?;
     }
 
     #[cfg(target_os = "macos")]
