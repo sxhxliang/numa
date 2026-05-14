@@ -90,19 +90,26 @@ fn main() -> numa::Result<()> {
                 .build()?;
             return runtime.block_on(numa::relay::run(addr));
         }
-        "lan" => {
+        "lan" | "block" | "dnssec" => {
             let sub = std::env::args().nth(2).unwrap_or_default();
             let config_path = std::env::args()
                 .nth(3)
-                .unwrap_or_else(|| "numa.toml".to_string());
-            return match sub.as_str() {
-                "on" => set_lan_enabled(true, &config_path),
-                "off" => set_lan_enabled(false, &config_path),
+                .unwrap_or_else(numa::cli_config_path);
+            let enabled = match sub.as_str() {
+                "on" => true,
+                "off" => false,
                 _ => {
-                    eprintln!("Usage: numa lan <on|off> [config-path]");
-                    Ok(())
+                    eprintln!("Usage: numa {} <on|off> [config-path]", arg1);
+                    return Ok(());
                 }
             };
+            let (section, feature_name) = match arg1.as_str() {
+                "lan" => ("lan", "LAN discovery"),
+                "block" => ("blocking", "ad-blocking"),
+                "dnssec" => ("dnssec", "DNSSEC validation"),
+                _ => unreachable!(),
+            };
+            return set_config_bool(&config_path, section, "enabled", enabled, feature_name);
         }
         "version" | "--version" | "-V" => {
             eprintln!("numa {}", numa::version());
@@ -127,8 +134,9 @@ fn main() -> numa::Result<()> {
             eprintln!("  service stop    Uninstall the system service");
             eprintln!("  service restart Restart the service with updated binary");
             eprintln!("  service status  Check if the service is running");
-            eprintln!("  lan on          Enable LAN service discovery (mDNS)");
-            eprintln!("  lan off         Disable LAN service discovery");
+            eprintln!("  lan on|off      Enable/disable LAN service discovery (mDNS)");
+            eprintln!("  block on|off    Enable/disable ad-blocking");
+            eprintln!("  dnssec on|off   Enable/disable DNSSEC validation");
             eprintln!("  relay [PORT] [BIND]");
             eprintln!("                  Run as an ODoH relay (RFC 9230, default 127.0.0.1:8443)");
             eprintln!("  setup-phone     Generate a QR code to install Numa DoT on a phone");
@@ -168,33 +176,52 @@ fn main() -> numa::Result<()> {
     runtime.block_on(numa::serve::run(config_path))
 }
 
-fn set_lan_enabled(enabled: bool, path: &str) -> numa::Result<()> {
+fn set_config_bool(
+    path: &str,
+    section: &str,
+    key: &str,
+    value: bool,
+    feature_name: &str,
+) -> numa::Result<()> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(path, format!("[lan]\nenabled = {}\n", enabled))?;
-            print_lan_status(enabled);
+            if let Some(parent) = std::path::Path::new(path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, format!("[{}]\n{} = {}\n", section, key, value))?;
+            print_toggle_status(feature_name, value, path);
             return Ok(());
         }
         Err(e) => return Err(e.into()),
     };
 
-    // Track current TOML section while scanning lines
-    let mut in_lan = false;
+    let result = update_config_content(&contents, section, key, value);
+    std::fs::write(path, result)?;
+    print_toggle_status(feature_name, value, path);
+    Ok(())
+}
+
+fn update_config_content(contents: &str, section: &str, key: &str, value: bool) -> String {
+    let section_header = format!("[{}]", section);
+    let mut in_section = false;
     let mut found = false;
     let mut lines: Vec<String> = contents
         .lines()
         .map(|line| {
             let trimmed = line.trim();
             if trimmed.starts_with('[') {
-                in_lan = trimmed == "[lan]";
+                in_section = trimmed == section_header;
             }
-            if in_lan && !found {
-                if let Some((key, _)) = trimmed.split_once('=') {
-                    if key.trim() == "enabled" {
+            if in_section && !found {
+                if let Some((k, _)) = trimmed.split_once('=') {
+                    if k.trim() == key {
                         found = true;
                         let indent = &line[..line.len() - trimmed.len()];
-                        return format!("{}enabled = {}", indent, enabled);
+                        return format!("{}{} = {}", indent, key, value);
                     }
                 }
             }
@@ -203,12 +230,14 @@ fn set_lan_enabled(enabled: bool, path: &str) -> numa::Result<()> {
         .collect();
 
     if !found {
-        if let Some(i) = lines.iter().position(|l| l.trim() == "[lan]") {
-            lines.insert(i + 1, format!("enabled = {}", enabled));
+        if let Some(i) = lines.iter().position(|l| l.trim() == section_header) {
+            lines.insert(i + 1, format!("{} = {}", key, value));
         } else {
-            lines.push(String::new());
-            lines.push("[lan]".to_string());
-            lines.push(format!("enabled = {}", enabled));
+            if !lines.is_empty() && !lines.last().unwrap().is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(section_header);
+            lines.push(format!("{} = {}", key, value));
         }
     }
 
@@ -216,19 +245,50 @@ fn set_lan_enabled(enabled: bool, path: &str) -> numa::Result<()> {
     if !result.ends_with('\n') {
         result.push('\n');
     }
-    std::fs::write(path, result)?;
-    print_lan_status(enabled);
-    Ok(())
+    result
 }
 
-fn print_lan_status(enabled: bool) {
+fn print_toggle_status(feature: &str, enabled: bool, path: &str) {
     let label = if enabled { "enabled" } else { "disabled" };
     let color = if enabled { "32" } else { "33" };
     eprintln!(
-        "\x1b[1;38;2;192;98;58mNuma\x1b[0m — LAN discovery \x1b[{}m{}\x1b[0m",
-        color, label
+        "\x1b[1;38;2;192;98;58mNuma\x1b[0m — {} \x1b[{}m{}\x1b[0m",
+        feature, color, label
     );
+    eprintln!("  Wrote {}", path);
     if enabled {
-        eprintln!("  Restart Numa to start mDNS discovery");
+        eprintln!("  Restart Numa for changes to take effect");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_config_content() {
+        let input =
+            "[dnssec]\nstrict = true\n\n[lan]\nenabled = false\n\n[blocking]\nrefresh_hours = 24\n";
+
+        let output = update_config_content(input, "lan", "enabled", true);
+        assert!(output.contains("[lan]\nenabled = true"));
+        assert!(output.contains("[dnssec]"));
+        assert!(output.contains("[blocking]"));
+
+        let output = update_config_content(input, "blocking", "enabled", true);
+        assert!(output.contains("[blocking]\nenabled = true"));
+        assert!(output.contains("refresh_hours = 24"));
+
+        let output = update_config_content(input, "mobile", "enabled", true);
+        assert!(output.contains("[mobile]\nenabled = true"));
+    }
+
+    #[test]
+    fn test_update_config_inserts_into_existing_later_section() {
+        // New key must land inside [lan], not at EOF or inside [blocking].
+        let input = "[blocking]\nenabled = false\n\n[lan]\nfoo = 1\n";
+        let output = update_config_content(input, "lan", "enabled", true);
+        assert!(output.contains("[lan]\nenabled = true\nfoo = 1"));
+        assert!(output.contains("[blocking]\nenabled = false"));
     }
 }

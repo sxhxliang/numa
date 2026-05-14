@@ -140,7 +140,7 @@ impl Transport {
 /// `Option<UpstreamTransport>` — `None` for resolutions that never touched
 /// a forwarder (cache/local/blocked) or for recursive mode, which has its
 /// own counter via `QueryPath::Recursive`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UpstreamTransport {
     Udp,
     Tcp,

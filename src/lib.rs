@@ -144,6 +144,21 @@ fn config_dir_unix() -> std::path::PathBuf {
     daemon_data_dir()
 }
 
+/// Default config path for CLI toggles (`numa lan on`, etc.) and the
+/// Windows service entry. On Windows this matches the SCM's data dir
+/// so toggles update the file the service reads (issue #202). Unix
+/// callers still use the CWD-relative literal `"numa.toml"`.
+pub fn cli_config_path() -> String {
+    #[cfg(windows)]
+    {
+        data_dir().join("numa.toml").to_string_lossy().into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        "numa.toml".to_string()
+    }
+}
+
 /// Default system-wide data directory for TLS certs. Overridable via
 /// `[server] data_dir = "..."` in numa.toml — this function only provides
 /// the fallback when the config doesn't set it.

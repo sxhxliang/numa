@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use crate::stats::UpstreamTransport;
+
 const INITIAL_SRTT_MS: u64 = 200;
 const FAILURE_PENALTY_MS: u64 = 5000;
-const TCP_PENALTY_MS: u64 = 100;
 const DECAY_AFTER_SECS: u64 = 300;
 const MAX_ENTRIES: usize = 4096;
 const EVICT_BATCH: usize = 64;
@@ -12,7 +13,10 @@ const EVICT_BATCH: usize = 64;
 /// Failover circuit-breaker threshold: a primary upstream at or above this
 /// SRTT is skipped when a fallback is available. Calibrated between
 /// `INITIAL_SRTT_MS` and `FAILURE_PENALTY_MS` so a single failure trips it
-/// and decay un-trips it within ~5 minutes.
+/// and decay un-trips it within ~5 minutes. With per-`(ip, transport)`
+/// keying, success on a sibling transport (e.g. TCP fallback for the same
+/// IP) does NOT re-arm probing of the broken transport — so on UDP-hostile
+/// networks the UDP timeout is taken at most once per decay window.
 pub const PRIMARY_SKIP_SRTT_MS: u64 = 4000;
 
 struct SrttEntry {
@@ -20,8 +24,11 @@ struct SrttEntry {
     updated_at: Instant,
 }
 
+/// Per-(ip, transport) EWMA so a UDP-hostile path (BCP 38) doesn't poison
+/// TCP's score on the same IP, and DoT TLS failures stay isolated from
+/// plain TCP. DoH/ODoH route through a URL+pool, never key here.
 pub struct SrttCache {
-    entries: HashMap<IpAddr, SrttEntry>,
+    entries: HashMap<(IpAddr, UpstreamTransport), SrttEntry>,
     enabled: bool,
 }
 
@@ -43,17 +50,18 @@ impl SrttCache {
         self.enabled
     }
 
-    /// Get current SRTT for an IP, applying decay if stale. Returns INITIAL for unknown.
-    pub fn get(&self, ip: IpAddr) -> u64 {
-        match self.entries.get(&ip) {
+    /// Get current SRTT for an (IP, transport), applying decay if stale.
+    /// Returns INITIAL for unknown.
+    pub fn get(&self, ip: IpAddr, transport: UpstreamTransport) -> u64 {
+        match self.entries.get(&(ip, transport)) {
             Some(entry) => Self::decayed_srtt(entry),
             None => INITIAL_SRTT_MS,
         }
     }
 
-    /// Whether we have observed RTT data for this IP.
-    pub fn is_known(&self, ip: IpAddr) -> bool {
-        self.entries.contains_key(&ip)
+    /// Whether we have observed RTT data for this (IP, transport).
+    pub fn is_known(&self, ip: IpAddr, transport: UpstreamTransport) -> bool {
+        self.entries.contains_key(&(ip, transport))
     }
 
     /// Apply time-based decay: each DECAY_AFTER_SECS period halves distance to INITIAL.
@@ -75,30 +83,29 @@ impl SrttCache {
     }
 
     /// Record a successful query RTT. No-op when disabled.
-    pub fn record_rtt(&mut self, ip: IpAddr, rtt_ms: u64, tcp: bool) {
+    pub fn record_rtt(&mut self, ip: IpAddr, transport: UpstreamTransport, rtt_ms: u64) {
         if !self.enabled {
             return;
         }
-        let effective = if tcp { rtt_ms + TCP_PENALTY_MS } else { rtt_ms };
         self.maybe_evict();
-        let entry = self.entries.entry(ip).or_insert(SrttEntry {
-            srtt_ms: effective,
+        let entry = self.entries.entry((ip, transport)).or_insert(SrttEntry {
+            srtt_ms: rtt_ms,
             updated_at: Instant::now(),
         });
         // Apply decay before EWMA so recovered servers aren't stuck at stale penalties
         let base = Self::decayed_srtt(entry);
         // BIND EWMA: new = (old * 7 + sample) / 8
-        entry.srtt_ms = (base * 7 + effective) / 8;
+        entry.srtt_ms = (base * 7 + rtt_ms) / 8;
         entry.updated_at = Instant::now();
     }
 
     /// Record a failure (timeout or error). No-op when disabled.
-    pub fn record_failure(&mut self, ip: IpAddr) {
+    pub fn record_failure(&mut self, ip: IpAddr, transport: UpstreamTransport) {
         if !self.enabled {
             return;
         }
         self.maybe_evict();
-        let entry = self.entries.entry(ip).or_insert(SrttEntry {
+        let entry = self.entries.entry((ip, transport)).or_insert(SrttEntry {
             srtt_ms: FAILURE_PENALTY_MS,
             updated_at: Instant::now(),
         });
@@ -106,17 +113,17 @@ impl SrttCache {
         entry.updated_at = Instant::now();
     }
 
-    /// Sort addresses by SRTT ascending (lowest/fastest first). No-op when disabled.
-    pub fn sort_by_rtt(&self, addrs: &mut [SocketAddr]) {
+    /// Sort by UDP SRTT ascending (lowest/fastest first). No-op when disabled.
+    pub fn sort_by_udp_rtt(&self, addrs: &mut [SocketAddr]) {
         if !self.enabled {
             return;
         }
-        addrs.sort_by_key(|a| self.get(a.ip()));
+        addrs.sort_by_key(|a| self.get(a.ip(), UpstreamTransport::Udp));
     }
 
     pub fn heap_bytes(&self) -> usize {
         let per_slot = std::mem::size_of::<u64>()
-            + std::mem::size_of::<IpAddr>()
+            + std::mem::size_of::<(IpAddr, UpstreamTransport)>()
             + std::mem::size_of::<SrttEntry>()
             + 1;
         self.entries.capacity() * per_slot
@@ -135,10 +142,10 @@ impl SrttCache {
             return;
         }
         // Batch eviction: remove the oldest EVICT_BATCH entries at once
-        let mut by_age: Vec<IpAddr> = self.entries.keys().copied().collect();
-        by_age.sort_by_key(|ip| self.entries[ip].updated_at);
-        for ip in by_age.into_iter().take(EVICT_BATCH) {
-            self.entries.remove(&ip);
+        let mut by_age: Vec<_> = self.entries.keys().copied().collect();
+        by_age.sort_by_key(|k| self.entries[k].updated_at);
+        for k in by_age.into_iter().take(EVICT_BATCH) {
+            self.entries.remove(&k);
         }
     }
 }
@@ -147,6 +154,9 @@ impl SrttCache {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    const UDP: UpstreamTransport = UpstreamTransport::Udp;
+    const TCP: UpstreamTransport = UpstreamTransport::Tcp;
 
     fn ip(last: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
@@ -159,48 +169,65 @@ mod tests {
     #[test]
     fn unknown_returns_initial() {
         let cache = SrttCache::new(true);
-        assert_eq!(cache.get(ip(1)), INITIAL_SRTT_MS);
+        assert_eq!(cache.get(ip(1), UDP), INITIAL_SRTT_MS);
     }
 
     #[test]
     fn ewma_converges() {
         let mut cache = SrttCache::new(true);
         for _ in 0..20 {
-            cache.record_rtt(ip(1), 100, false);
+            cache.record_rtt(ip(1), UDP, 100);
         }
-        let srtt = cache.get(ip(1));
+        let srtt = cache.get(ip(1), UDP);
         assert!(srtt >= 98 && srtt <= 102, "srtt={}", srtt);
     }
 
     #[test]
     fn failure_sets_penalty() {
         let mut cache = SrttCache::new(true);
-        cache.record_rtt(ip(1), 50, false);
-        cache.record_failure(ip(1));
-        assert_eq!(cache.get(ip(1)), FAILURE_PENALTY_MS);
+        cache.record_rtt(ip(1), UDP, 50);
+        cache.record_failure(ip(1), UDP);
+        assert_eq!(cache.get(ip(1), UDP), FAILURE_PENALTY_MS);
     }
 
     #[test]
-    fn tcp_penalty_added() {
+    fn udp_and_tcp_are_independent() {
+        // UDP penalty must not bleed into the TCP EWMA on the same IP.
         let mut cache = SrttCache::new(true);
+        cache.record_failure(ip(1), UDP);
         for _ in 0..20 {
-            cache.record_rtt(ip(1), 50, true);
+            cache.record_rtt(ip(1), TCP, 50);
         }
-        let srtt = cache.get(ip(1));
-        assert!(srtt >= 148 && srtt <= 152, "srtt={}", srtt);
+        assert_eq!(cache.get(ip(1), UDP), FAILURE_PENALTY_MS);
+        let tcp = cache.get(ip(1), TCP);
+        assert!(tcp >= 48 && tcp <= 52, "tcp srtt drifted: {}", tcp);
     }
 
     #[test]
-    fn sort_by_rtt_orders_correctly() {
+    fn sort_by_udp_rtt_orders_correctly() {
         let mut cache = SrttCache::new(true);
         for _ in 0..20 {
-            cache.record_rtt(ip(1), 500, false);
-            cache.record_rtt(ip(2), 100, false);
-            cache.record_rtt(ip(3), 10, false);
+            cache.record_rtt(ip(1), UDP, 500);
+            cache.record_rtt(ip(2), UDP, 100);
+            cache.record_rtt(ip(3), UDP, 10);
         }
         let mut addrs = vec![sock(1), sock(2), sock(3)];
-        cache.sort_by_rtt(&mut addrs);
+        cache.sort_by_udp_rtt(&mut addrs);
         assert_eq!(addrs, vec![sock(3), sock(2), sock(1)]);
+    }
+
+    #[test]
+    fn sort_by_udp_rtt_ignores_tcp_entries() {
+        // TCP scores must not influence UDP-context sorting.
+        let mut cache = SrttCache::new(true);
+        for _ in 0..20 {
+            cache.record_rtt(ip(1), TCP, 10); // would sort first if TCP leaked in
+            cache.record_rtt(ip(2), UDP, 100);
+        }
+        let mut addrs = vec![sock(1), sock(2)];
+        cache.sort_by_udp_rtt(&mut addrs);
+        // ip(1) has no UDP record → INITIAL (200) > ip(2) UDP (100)
+        assert_eq!(addrs, vec![sock(2), sock(1)]);
     }
 
     #[test]
@@ -208,20 +235,20 @@ mod tests {
         let cache = SrttCache::new(true);
         let mut addrs = vec![sock(1), sock(2), sock(3)];
         let original = addrs.clone();
-        cache.sort_by_rtt(&mut addrs);
+        cache.sort_by_udp_rtt(&mut addrs);
         assert_eq!(addrs, original);
     }
 
     #[test]
     fn disabled_is_noop() {
         let mut cache = SrttCache::new(false);
-        cache.record_rtt(ip(1), 50, false);
-        cache.record_failure(ip(2));
+        cache.record_rtt(ip(1), UDP, 50);
+        cache.record_failure(ip(2), UDP);
         assert_eq!(cache.len(), 0);
 
         let mut addrs = vec![sock(2), sock(1)];
         let original = addrs.clone();
-        cache.sort_by_rtt(&mut addrs);
+        cache.sort_by_udp_rtt(&mut addrs);
         assert_eq!(addrs, original);
     }
 
@@ -300,7 +327,7 @@ mod tests {
         let mut cache = SrttCache::new(true);
         let empty = cache.heap_bytes();
         for i in 1..=10u8 {
-            cache.record_rtt(ip(i), 100, false);
+            cache.record_rtt(ip(i), UDP, 100);
         }
         assert!(cache.heap_bytes() > empty);
     }
@@ -317,12 +344,12 @@ mod tests {
             ];
             cache.record_rtt(
                 IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
+                UDP,
                 100,
-                false,
             );
         }
         assert_eq!(cache.len(), MAX_ENTRIES);
-        cache.record_rtt(ip(1), 100, false);
+        cache.record_rtt(ip(1), UDP, 100);
         // Batch eviction removes EVICT_BATCH entries
         assert!(cache.len() <= MAX_ENTRIES - EVICT_BATCH + 1);
     }
