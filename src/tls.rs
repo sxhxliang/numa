@@ -118,6 +118,16 @@ pub fn ensure_ca_files(dir: &Path) -> crate::Result<()> {
 }
 
 fn ensure_ca(dir: &Path) -> crate::Result<(CertificateDer<'static>, Issuer<'static, KeyPair>)> {
+    load_ca(dir)
+}
+
+/// Materialize the CA: load from disk if `ca.pem` + `ca.key` exist, else
+/// generate a new self-signed CA (10-year validity) and persist it.
+/// Pub-within-crate so the MitM cert resolver can sign per-SNI leaves
+/// with the same CA that signs the .numa proxy cert.
+pub(crate) fn load_ca(
+    dir: &Path,
+) -> crate::Result<(CertificateDer<'static>, Issuer<'static, KeyPair>)> {
     let ca_key_path = dir.join("ca.key");
     let ca_cert_path = dir.join(CA_FILE_NAME);
 
@@ -224,6 +234,25 @@ fn generate_service_cert(
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
     Ok((vec![cert_der, ca_cert_der], key_der))
+}
+
+/// Build a TLS `ServerConfig` whose certificates are produced on-the-fly
+/// by `resolver`, instead of one fixed cert chain. Mirrors `build_tls_config`
+/// but plugs into rustls's per-SNI cert resolution path. Used by the MitM
+/// listener so each incoming connection gets a leaf signed for the exact
+/// SNI the client requested.
+pub fn build_mitm_tls_config(
+    resolver: std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Arc<rustls::ServerConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    // ALPN left empty — forces HTTP/1.1 since the MitM forwarder/proxy v1
+    // doesn't support h2/WebSocket. Negotiating h2 here would silently
+    // break captures.
+    config.alpn_protocols = Vec::new();
+    Arc::new(config)
 }
 
 #[cfg(test)]

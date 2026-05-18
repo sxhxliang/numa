@@ -97,6 +97,7 @@ pub struct ServerStats {
     queries_blocked: u64,
     queries_local: u64,
     queries_overridden: u64,
+    queries_mitm: u64,
     upstream_errors: u64,
     transport_udp: u64,
     transport_tcp: u64,
@@ -174,6 +175,9 @@ pub enum QueryPath {
     Blocked,
     Overridden,
     UpstreamError,
+    /// Hijacked to the local MitM proxy IP. The real upstream IP was
+    /// resolved and cached in `MitmStores::upstream_cache`.
+    Mitm,
 }
 
 impl QueryPath {
@@ -188,6 +192,7 @@ impl QueryPath {
             QueryPath::Blocked => "BLOCKED",
             QueryPath::Overridden => "OVERRIDE",
             QueryPath::UpstreamError => "SERVFAIL",
+            QueryPath::Mitm => "MITM",
         }
     }
 
@@ -210,6 +215,8 @@ impl QueryPath {
             Some(QueryPath::Overridden)
         } else if s.eq_ignore_ascii_case("SERVFAIL") {
             Some(QueryPath::UpstreamError)
+        } else if s.eq_ignore_ascii_case("MITM") {
+            Some(QueryPath::Mitm)
         } else {
             None
         }
@@ -234,6 +241,7 @@ impl ServerStats {
             queries_blocked: 0,
             queries_local: 0,
             queries_overridden: 0,
+            queries_mitm: 0,
             upstream_errors: 0,
             transport_udp: 0,
             transport_tcp: 0,
@@ -270,6 +278,7 @@ impl ServerStats {
             QueryPath::Blocked => self.queries_blocked += 1,
             QueryPath::Overridden => self.queries_overridden += 1,
             QueryPath::UpstreamError => self.upstream_errors += 1,
+            QueryPath::Mitm => self.queries_mitm += 1,
         }
         match transport {
             Transport::Udp => self.transport_udp += 1,
@@ -309,6 +318,7 @@ impl ServerStats {
             local: self.queries_local,
             overridden: self.queries_overridden,
             blocked: self.queries_blocked,
+            mitm: self.queries_mitm,
             errors: self.upstream_errors,
             transport_udp: self.transport_udp,
             transport_tcp: self.transport_tcp,
@@ -366,6 +376,7 @@ pub struct StatsSnapshot {
     pub local: u64,
     pub overridden: u64,
     pub blocked: u64,
+    pub mitm: u64,
     pub errors: u64,
     pub transport_udp: u64,
     pub transport_tcp: u64,

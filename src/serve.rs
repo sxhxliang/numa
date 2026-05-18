@@ -142,6 +142,21 @@ pub async fn run(config_path: String) -> crate::Result<()> {
 
     let ca_pem = std::fs::read_to_string(resolved_data_dir.join("ca.pem")).ok();
 
+    // MitM stores are initialized when [mitm].enabled = true. Construction
+    // can fail (e.g. read-only data_dir) — in that case we log and fall back
+    // to None so the rest of numa keeps working.
+    let mitm_stores = if config.mitm.enabled {
+        match crate::mitm::MitmStores::new(config.mitm.clone(), &resolved_data_dir) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                log::warn!("MitM setup failed, MitM interception disabled: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let socket = match UdpSocket::bind(&config.server.bind_addr).await {
         Ok(s) => s,
         Err(e) => {
@@ -201,6 +216,7 @@ pub async fn run(config_path: String) -> crate::Result<()> {
         mobile_enabled: config.mobile.enabled,
         mobile_port: config.mobile.port,
         filter_aaaa: config.server.filter_aaaa,
+        mitm: mitm_stores,
     });
 
     let zone_count: usize = ctx.zone_map.values().map(|m| m.len()).sum();
@@ -326,6 +342,22 @@ fn spawn_background_services(
         let pp_cfg = config.proxy.proxy_protocol.clone();
         tokio::spawn(async move {
             crate::proxy::start_proxy_tls(proxy_ctx, tls_port, proxy_bind, &pp_cfg).await;
+        });
+    }
+
+    // MitM HTTPS + HTTP listeners. Both share the same MitmStores; HTTPS
+    // adds dynamic-cert TLS termination, HTTP routes by Host header only.
+    if let Some(mitm) = ctx.mitm.clone() {
+        let ctx_https = Arc::clone(ctx);
+        let mitm_https = Arc::clone(&mitm);
+        tokio::spawn(async move {
+            crate::mitm::proxy::start_mitm_https(ctx_https, mitm_https).await;
+        });
+
+        let ctx_http = Arc::clone(ctx);
+        let mitm_http = mitm;
+        tokio::spawn(async move {
+            crate::mitm::proxy::start_mitm_http(ctx_http, mitm_http).await;
         });
     }
 

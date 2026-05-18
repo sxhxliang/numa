@@ -24,6 +24,7 @@ const FONT_INSTRUMENT_ITALIC: &[u8] =
 const FONT_JETBRAINS: &[u8] = include_bytes!("../site/fonts/jetbrains-mono-latin.woff2");
 
 pub fn router(ctx: Arc<ServerCtx>) -> Router {
+    let mitm_router = crate::mitm::api::router(Arc::clone(&ctx));
     Router::new()
         .route("/", get(dashboard))
         .route("/overrides", post(create_overrides))
@@ -81,6 +82,7 @@ pub fn router(ctx: Arc<ServerCtx>) -> Router {
             get(|| async { serve_font(FONT_JETBRAINS) }),
         )
         .with_state(ctx)
+        .merge(mitm_router)
 }
 
 async fn dashboard() -> impl IntoResponse {
@@ -235,6 +237,7 @@ struct QueriesStats {
     local: u64,
     overridden: u64,
     blocked: u64,
+    mitm: u64,
     errors: u64,
 }
 
@@ -656,6 +659,7 @@ async fn stats(State(ctx): State<Arc<ServerCtx>>) -> Json<StatsResponse> {
             local: snap.local,
             overridden: snap.overridden,
             blocked: snap.blocked,
+            mitm: snap.mitm,
             errors: snap.errors,
         },
         transport: TransportStats {

@@ -82,6 +82,9 @@ pub struct ServerCtx {
     /// answer) instead of hitting cache/forwarding/upstream. Local data
     /// (overrides, zones, .numa proxy, blocklist sinkhole) is unaffected.
     pub filter_aaaa: bool,
+    /// MitM HTTPS interception state. `None` when MitM is disabled in
+    /// config — the DNS hijack hook and proxy listeners both no-op.
+    pub mitm: Option<Arc<crate::mitm::MitmStores>>,
 }
 
 pub const REMOVED_PROXY_DOMAIN_GRACE_PERIOD: Duration = Duration::from_secs(120);
@@ -262,6 +265,91 @@ pub async fn resolve_query(
     Ok((resp_buffer, path))
 }
 
+/// MitM DNS hijack: when `qname` is on the rule list, return the local
+/// proxy IP instead of the real upstream. The real IP is captured (from
+/// cache, or via background prefetch) into `MitmStores::upstream_cache`
+/// so the proxy can dial the genuine origin when re-encrypting.
+///
+/// Returns `None` when MitM is disabled, rule is missing, or qtype is
+/// non-address (CNAME/MX/etc fall through to normal resolution — only
+/// A/AAAA need to be hijacked for HTTPS interception).
+fn try_mitm_hijack(
+    query: &DnsPacket,
+    src_addr: SocketAddr,
+    qname: &str,
+    qtype: QueryType,
+    ctx: &Arc<ServerCtx>,
+) -> Option<(DnsPacket, QueryPath, DnssecStatus)> {
+    let mitm = ctx.mitm.as_ref()?;
+    if !mitm.config.enabled {
+        return None;
+    }
+    if !matches!(qtype, QueryType::A | QueryType::AAAA) {
+        return None;
+    }
+    if !mitm.rules.read().unwrap().is_listed(qname) {
+        return None;
+    }
+
+    // Populate the real-IP cache from a hot DNS cache entry if possible.
+    // Cache miss → spawn a refresh so the next query lands on a hot cache;
+    // the in-flight client request will resolve the upstream itself in the
+    // forwarder (Phase E), or 502 and let the client retry.
+    let cached_ips: Vec<std::net::IpAddr> = ctx
+        .cache
+        .read()
+        .unwrap()
+        .lookup_with_status(qname, qtype)
+        .map(|(pkt, _, _)| {
+            pkt.answers
+                .iter()
+                .filter_map(|r| match r {
+                    DnsRecord::A { addr, .. } => Some(std::net::IpAddr::V4(*addr)),
+                    DnsRecord::AAAA { addr, .. } => Some(std::net::IpAddr::V6(*addr)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if cached_ips.is_empty() {
+        let ctx2 = Arc::clone(ctx);
+        let qname_owned = qname.to_string();
+        let key = (qname_owned.clone(), qtype);
+        let already_refreshing = !ctx.refreshing.lock().unwrap().insert(key.clone());
+        if !already_refreshing {
+            tokio::spawn(async move {
+                refresh_entry(&ctx2, &qname_owned, qtype).await;
+                ctx2.refreshing.lock().unwrap().remove(&key);
+            });
+        }
+    } else {
+        mitm.upstream_cache
+            .lock()
+            .unwrap()
+            .put(qname, cached_ips, 30);
+    }
+
+    // Synthesize the hijack answer: loopback for local clients, LAN IP for
+    // remote ones — same shape as `resolve_proxy_tld`.
+    let is_remote = !src_addr.ip().is_loopback();
+    let v4 = if is_remote {
+        *ctx.lan_ip.lock().unwrap()
+    } else {
+        std::net::Ipv4Addr::LOCALHOST
+    };
+    let v6 = if v4 == std::net::Ipv4Addr::LOCALHOST {
+        std::net::Ipv6Addr::LOCALHOST
+    } else {
+        v4.to_ipv6_mapped()
+    };
+
+    let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
+    resp.answers
+        .push(sinkhole_record(qname, qtype, v4, v6, 30));
+    Some((resp, QueryPath::Mitm, DnssecStatus::Indeterminate))
+}
+
 /// Local resolution pipeline: overrides, .localhost, zones, special-use, .numa
 /// proxy TLD, blocklist, AAAA filter. Returns `None` to fall through to remote
 /// resolution (cache/forwarding/recursive/upstream).
@@ -270,7 +358,7 @@ fn resolve_local(
     src_addr: SocketAddr,
     qname: &str,
     qtype: QueryType,
-    ctx: &ServerCtx,
+    ctx: &Arc<ServerCtx>,
 ) -> Option<(DnsPacket, QueryPath, DnssecStatus)> {
     if let Some(record) = ctx.overrides.read().unwrap().lookup(qname) {
         let mut resp = DnsPacket::response_from(query, ResultCode::NOERROR);
@@ -321,6 +409,9 @@ fn resolve_local(
             60,
         ));
         return Some((resp, QueryPath::Blocked, DnssecStatus::Indeterminate));
+    }
+    if let Some(resp) = try_mitm_hijack(query, src_addr, qname, qtype, ctx) {
+        return Some(resp);
     }
     if qtype == QueryType::AAAA && ctx.filter_aaaa {
         // RFC 2308 NODATA: NOERROR with empty answer section. Prevents
@@ -1306,6 +1397,140 @@ mod tests {
             DnsRecord::A { addr, .. } => assert_eq!(*addr, Ipv4Addr::LOCALHOST),
             other => panic!("expected A record, got {:?}", other),
         }
+    }
+
+    // ── MitM DNS hijack hook (Phase B) ─────────────────────────────────
+
+    fn mitm_test_config() -> crate::config::MitmConfig {
+        crate::config::MitmConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn mitm_stores(config: crate::config::MitmConfig) -> Arc<crate::mitm::MitmStores> {
+        // Construct against a per-test tempdir so concurrent tests don't
+        // race on `ca.pem`. The CA is auto-generated on first call.
+        let dir = std::env::temp_dir().join(format!(
+            "numa-test-mitm-ctx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(crate::mitm::MitmStores::new(config, &dir).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mitm_hijack_returns_loopback_for_local_client() {
+        let mut ctx = crate::testutil::test_ctx().await;
+        ctx.mitm = Some(mitm_stores(mitm_test_config()));
+        ctx.mitm
+            .as_ref()
+            .unwrap()
+            .rules
+            .write()
+            .unwrap()
+            .insert("api.example.com", true);
+
+        // Pre-populate cache with the "real" upstream IP so the hijack
+        // can synchronously stash it in upstream_cache.
+        let real = crate::testutil::a_record_response(
+            "api.example.com",
+            Ipv4Addr::new(93, 184, 216, 34),
+            300,
+        );
+        ctx.cache
+            .write()
+            .unwrap()
+            .insert("api.example.com", QueryType::A, &real);
+
+        let ctx = Arc::new(ctx);
+        let (resp, path) = resolve_in_test(&ctx, "api.example.com", QueryType::A).await;
+
+        assert_eq!(path, QueryPath::Mitm);
+        match &resp.answers[0] {
+            DnsRecord::A { addr, .. } => {
+                assert_eq!(*addr, Ipv4Addr::LOCALHOST, "local client → loopback hijack")
+            }
+            other => panic!("expected A record, got {:?}", other),
+        }
+
+        // upstream_cache should now hold the original real IP so the
+        // forwarder can dial the genuine origin in Phase E.
+        let mitm = ctx.mitm.as_ref().unwrap();
+        let cache = mitm.upstream_cache.lock().unwrap();
+        let rec = cache
+            .lookup("api.example.com")
+            .expect("real upstream IP must be cached at hijack time");
+        assert_eq!(
+            rec.first_ip(),
+            Some(std::net::IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_hijack_skipped_when_rule_absent() {
+        let upstream_resp = crate::testutil::a_record_response(
+            "elsewhere.example.com",
+            Ipv4Addr::new(1, 1, 1, 1),
+            300,
+        );
+        let upstream_addr = crate::testutil::mock_upstream(upstream_resp).await;
+
+        let mut ctx = crate::testutil::test_ctx().await;
+        ctx.mitm = Some(mitm_stores(mitm_test_config()));
+        // Rule exists for a different domain — must not hijack our target.
+        ctx.mitm
+            .as_ref()
+            .unwrap()
+            .rules
+            .write()
+            .unwrap()
+            .insert("other.example.com", true);
+        ctx.upstream_pool
+            .lock()
+            .unwrap()
+            .set_primary(vec![Upstream::Udp(upstream_addr)]);
+        let ctx = Arc::new(ctx);
+
+        let (_resp, path) = resolve_in_test(&ctx, "elsewhere.example.com", QueryType::A).await;
+        // Should hit the upstream, not the MitM hijack.
+        assert_eq!(path, QueryPath::Upstream);
+    }
+
+    #[tokio::test]
+    async fn mitm_hijack_skipped_when_disabled() {
+        let upstream_resp = crate::testutil::a_record_response(
+            "api.example.com",
+            Ipv4Addr::new(1, 1, 1, 1),
+            300,
+        );
+        let upstream_addr = crate::testutil::mock_upstream(upstream_resp).await;
+
+        let mut ctx = crate::testutil::test_ctx().await;
+        let disabled = crate::config::MitmConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        ctx.mitm = Some(mitm_stores(disabled));
+        ctx.mitm
+            .as_ref()
+            .unwrap()
+            .rules
+            .write()
+            .unwrap()
+            .insert("api.example.com", true);
+        ctx.upstream_pool
+            .lock()
+            .unwrap()
+            .set_primary(vec![Upstream::Udp(upstream_addr)]);
+        let ctx = Arc::new(ctx);
+
+        let (_resp, path) = resolve_in_test(&ctx, "api.example.com", QueryType::A).await;
+        assert_eq!(path, QueryPath::Upstream, "disabled MitM must not hijack");
     }
 
     #[tokio::test]

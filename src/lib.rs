@@ -12,6 +12,7 @@ pub mod forward;
 pub mod header;
 pub mod health;
 pub mod lan;
+pub mod mitm;
 pub mod mobile_api;
 pub mod mobileconfig;
 pub mod odoh;

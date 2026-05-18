@@ -35,6 +35,8 @@ pub struct Config {
     pub mobile: MobileConfig,
     #[serde(default)]
     pub forwarding: Vec<ForwardingRuleConfig>,
+    #[serde(default)]
+    pub mitm: MitmConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -769,6 +771,58 @@ fn default_mobile_port() -> u16 {
 
 fn default_mobile_bind_addr() -> String {
     "0.0.0.0".to_string()
+}
+
+/// MitM HTTPS interception. Off by default — when enabled, the DNS hijack
+/// only fires for domains explicitly added to `MitmStores::rules` via the
+/// `/mitm/rules` API.
+#[derive(Deserialize, Clone, Debug)]
+pub struct MitmConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mitm_https_port")]
+    pub https_port: u16,
+    #[serde(default = "default_mitm_http_port")]
+    pub http_port: u16,
+    #[serde(default = "default_mitm_bind_addr")]
+    pub bind_addr: String,
+    /// Ring-buffer depth for captures. Older entries are evicted FIFO.
+    #[serde(default = "default_mitm_capture_buffer")]
+    pub capture_buffer: usize,
+    /// Per-body cap. Bodies larger than this are truncated and flagged.
+    /// 256 KiB by default — enough for inspection without blowing memory
+    /// (`capture_buffer * max_body_bytes * 2 = worst case`).
+    #[serde(default = "default_mitm_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+impl Default for MitmConfig {
+    fn default() -> Self {
+        MitmConfig {
+            enabled: false,
+            https_port: default_mitm_https_port(),
+            http_port: default_mitm_http_port(),
+            bind_addr: default_mitm_bind_addr(),
+            capture_buffer: default_mitm_capture_buffer(),
+            max_body_bytes: default_mitm_max_body_bytes(),
+        }
+    }
+}
+
+fn default_mitm_https_port() -> u16 {
+    8443
+}
+fn default_mitm_http_port() -> u16 {
+    8080
+}
+fn default_mitm_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_mitm_capture_buffer() -> usize {
+    1000
+}
+fn default_mitm_max_body_bytes() -> usize {
+    256 * 1024
 }
 
 #[cfg(test)]
