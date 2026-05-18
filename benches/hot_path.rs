@@ -171,6 +171,33 @@ fn bench_cache_populated_lookup(c: &mut Criterion) {
     });
 }
 
+fn bench_zone_lookup_miss(c: &mut Criterion) {
+    // The regression-prone case: every non-zone query pays for the wildcard
+    // check. Map mixes exact + wildcard entries so the suffix walk runs.
+    use numa::config::{build_zone_map, ZoneRecord};
+    let map = build_zone_map(&[
+        ZoneRecord {
+            domain: "internal.example".into(),
+            record_type: "A".into(),
+            value: "10.0.0.1".into(),
+            ttl: 300,
+        },
+        ZoneRecord {
+            domain: "*.svc.cluster.local".into(),
+            record_type: "A".into(),
+            value: "10.0.0.2".into(),
+            ttl: 300,
+        },
+    ])
+    .unwrap();
+
+    c.bench_function("zone_lookup_miss", |b| {
+        b.iter(|| {
+            map.lookup(black_box("www.example.com"), QueryType::A);
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_buffer_parse,
@@ -181,5 +208,6 @@ criterion_group!(
     bench_cache_insert,
     bench_round_trip,
     bench_cache_populated_lookup,
+    bench_zone_lookup_miss,
 );
 criterion_main!(benches);

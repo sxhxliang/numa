@@ -165,6 +165,15 @@ tld = "numa"
 # value = "router.lan"
 # ttl = 300
 
+# Wildcard zones — one rule covers an entire subtree. Leftmost label only
+# (RFC 4592). Exact entries always win; the wildcard does NOT match its parent
+# (e.g. `*.pool.ntp.org` matches `time2.pool.ntp.org` but not `pool.ntp.org`).
+# [[zones]]
+# domain = "*.pool.ntp.org"
+# record_type = "CNAME"
+# value = "time.onsite"
+# ttl = 60
+
 # DNSSEC signature validation (requires mode = "recursive")
 # [dnssec]
 # enabled = false             # opt-in: verify chain of trust from root KSK

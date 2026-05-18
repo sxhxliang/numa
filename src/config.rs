@@ -844,15 +844,146 @@ mod tests {
         }];
         let map = build_zone_map(&zones).expect("PTR must load");
         let records = map
-            .get("1.0.168.192.in-addr.arpa")
-            .and_then(|m| m.get(&QueryType::PTR))
-            .expect("PTR record present");
+            .lookup("1.0.168.192.in-addr.arpa", QueryType::PTR)
+            .expect("hit");
         match &records[0] {
             DnsRecord::PTR { host, ttl, .. } => {
                 assert_eq!(host, "router.lan");
                 assert_eq!(*ttl, 300);
             }
             other => panic!("expected PTR, got {:?}", other),
+        }
+    }
+
+    fn zone(domain: &str, record_type: &str, value: &str) -> ZoneRecord {
+        ZoneRecord {
+            domain: domain.into(),
+            record_type: record_type.into(),
+            value: value.into(),
+            ttl: 300,
+        }
+    }
+
+    #[test]
+    fn wildcard_exact_match_takes_precedence() {
+        let map = build_zone_map(&[
+            zone("pool.ntp.org", "A", "10.0.0.1"),
+            zone("*.pool.ntp.org", "A", "10.0.0.2"),
+        ])
+        .unwrap();
+        let records = map.lookup("pool.ntp.org", QueryType::A).expect("hit");
+        match &records[0] {
+            DnsRecord::A { addr, .. } => assert_eq!(addr.octets(), [10, 0, 0, 1]),
+            other => panic!("expected A, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wildcard_matches_descendant() {
+        let map = build_zone_map(&[zone("*.pool.ntp.org", "A", "10.0.0.2")]).unwrap();
+        let records = map.lookup("time2.pool.ntp.org", QueryType::A).expect("hit");
+        match &records[0] {
+            DnsRecord::A { domain, addr, .. } => {
+                assert_eq!(domain, "time2.pool.ntp.org", "owner must be QNAME");
+                assert_eq!(addr.octets(), [10, 0, 0, 2]);
+            }
+            other => panic!("expected A, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wildcard_does_not_match_parent_itself() {
+        let map = build_zone_map(&[zone("*.pool.ntp.org", "A", "10.0.0.2")]).unwrap();
+        assert!(
+            map.lookup("pool.ntp.org", QueryType::A).is_none(),
+            "wildcard parent must not match the wildcard itself (RFC 4592 §2.1.1)"
+        );
+    }
+
+    #[test]
+    fn wildcard_longest_suffix_wins() {
+        let map = build_zone_map(&[
+            zone("*.b.c", "A", "10.0.0.1"),
+            zone("*.a.b.c", "A", "10.0.0.2"),
+        ])
+        .unwrap();
+        let records = map.lookup("x.a.b.c", QueryType::A).expect("hit");
+        match &records[0] {
+            DnsRecord::A { addr, .. } => assert_eq!(addr.octets(), [10, 0, 0, 2]),
+            other => panic!("expected A, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wildcard_matches_multi_label_descendant() {
+        let map = build_zone_map(&[zone("*.example.com", "A", "10.0.0.3")]).unwrap();
+        let records = map
+            .lookup("deep.sub.example.com", QueryType::A)
+            .expect("hit");
+        match &records[0] {
+            DnsRecord::A { domain, addr, .. } => {
+                assert_eq!(domain, "deep.sub.example.com");
+                assert_eq!(addr.octets(), [10, 0, 0, 3]);
+            }
+            other => panic!("expected A, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wildcard_invalid_configs_rejected() {
+        assert!(build_zone_map(&[zone("*", "A", "10.0.0.1")]).is_err());
+        assert!(build_zone_map(&[zone("*.*.foo", "A", "10.0.0.1")]).is_err());
+        assert!(build_zone_map(&[zone("foo.*.bar", "A", "10.0.0.1")]).is_err());
+        assert!(build_zone_map(&[zone("*foo.bar", "A", "10.0.0.1")]).is_err());
+    }
+
+    #[test]
+    fn wildcard_cname_rdata_stays_literal() {
+        let map = build_zone_map(&[zone("*.pool.ntp.org", "CNAME", "time.onsite")]).unwrap();
+        let records = map.lookup("x.pool.ntp.org", QueryType::CNAME).expect("hit");
+        match &records[0] {
+            DnsRecord::CNAME { domain, host, .. } => {
+                assert_eq!(domain, "x.pool.ntp.org", "owner is QNAME");
+                assert_eq!(
+                    host, "time.onsite",
+                    "RDATA target stays literal (RFC 4592 §2.3.1)"
+                );
+            }
+            other => panic!("expected CNAME, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wildcard_nodata_when_qtype_absent() {
+        let map = build_zone_map(&[zone("*.foo", "A", "10.0.0.1")]).unwrap();
+        let result = map.lookup("x.foo", QueryType::AAAA);
+        assert!(
+            result.as_ref().is_some_and(|r| r.is_empty()),
+            "wildcard parent matched but no AAAA — must be NODATA (Some/empty), not None (RFC 4592 §2.2.1)"
+        );
+    }
+
+    #[test]
+    fn exact_name_shadows_wildcard_across_types() {
+        let map = build_zone_map(&[
+            zone("foo.bar", "A", "10.0.0.1"),
+            zone("*.bar", "AAAA", "::1"),
+        ])
+        .unwrap();
+        let result = map.lookup("foo.bar", QueryType::AAAA);
+        assert!(
+            result.as_ref().is_some_and(|r| r.is_empty()),
+            "exact name shadows wildcard for all types (RFC 4592 §3.3.1)"
+        );
+    }
+
+    #[test]
+    fn wildcard_trailing_dot_normalized() {
+        let map = build_zone_map(&[zone("*.foo.bar.", "A", "10.0.0.1")]).unwrap();
+        let records = map.lookup("x.foo.bar", QueryType::A).expect("hit");
+        match &records[0] {
+            DnsRecord::A { addr, .. } => assert_eq!(addr.octets(), [10, 0, 0, 1]),
+            other => panic!("expected A, got {:?}", other),
         }
     }
 
@@ -1475,13 +1606,82 @@ pub fn load_config(path: &str) -> Result<ConfigLoad> {
     })
 }
 
-pub type ZoneMap = HashMap<String, HashMap<QueryType, Vec<DnsRecord>>>;
+#[derive(Default)]
+pub struct ZoneMap {
+    exact: HashMap<String, HashMap<QueryType, Vec<DnsRecord>>>,
+    wildcard: HashMap<String, HashMap<QueryType, Vec<DnsRecord>>>,
+}
+
+impl ZoneMap {
+    pub fn len(&self) -> usize {
+        self.exact.values().map(|m| m.len()).sum::<usize>()
+            + self.wildcard.values().map(|m| m.len()).sum::<usize>()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.wildcard.is_empty()
+    }
+
+    /// `None` = no zone owns this name (fall through to next stage).
+    /// `Some(rrs)` = zone owns name; empty vec is NODATA (RFC 4592 §2.2.1).
+    pub fn lookup(&self, qname: &str, qtype: QueryType) -> Option<Vec<DnsRecord>> {
+        if let Some(records) = self.exact.get(qname) {
+            return Some(records.get(&qtype).cloned().unwrap_or_default());
+        }
+        let mut rest = qname;
+        while let Some(dot) = rest.find('.') {
+            let parent = &rest[dot + 1..];
+            if parent.is_empty() {
+                break;
+            }
+            if let Some(records) = self.wildcard.get(parent) {
+                return Some(
+                    records
+                        .get(&qtype)
+                        .map(|rrs| {
+                            rrs.iter()
+                                .cloned()
+                                .map(|mut r| {
+                                    r.set_domain(qname.to_string());
+                                    r
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+            rest = parent;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_exact(records: Vec<DnsRecord>) -> Self {
+        let mut m = Self::default();
+        for r in records {
+            m.exact
+                .entry(r.domain().to_string())
+                .or_default()
+                .entry(r.query_type())
+                .or_default()
+                .push(r);
+        }
+        m
+    }
+}
 
 pub fn build_zone_map(zones: &[ZoneRecord]) -> Result<ZoneMap> {
-    let mut map: ZoneMap = HashMap::new();
+    let mut map = ZoneMap::default();
 
     for zone in zones {
-        let domain = zone.domain.to_lowercase();
+        let raw = zone.domain.to_lowercase();
+        let raw = raw.trim_end_matches('.');
+        let is_wildcard = raw.starts_with("*.");
+        let key = if is_wildcard { &raw[2..] } else { raw };
+        if key.is_empty() || key.contains('*') {
+            return Err(format!("invalid wildcard zone '{}'", raw).into());
+        }
+        let domain = key.to_string();
         let (qtype, record) = match zone.record_type.to_uppercase().as_str() {
             "A" => {
                 let addr: Ipv4Addr = zone
@@ -1560,7 +1760,13 @@ pub fn build_zone_map(zones: &[ZoneRecord]) -> Result<ZoneMap> {
             }
         };
 
-        map.entry(domain)
+        let bucket = if is_wildcard {
+            &mut map.wildcard
+        } else {
+            &mut map.exact
+        };
+        bucket
+            .entry(domain)
             .or_default()
             .entry(qtype)
             .or_default()

@@ -108,9 +108,7 @@ async fn resolve_doh(
         }
     };
 
-    let query_id = query.header.id;
-    let query_rd = query.header.recursion_desired;
-    let questions = query.questions.clone();
+    let query_for_error = query.clone();
 
     match resolve_query(query, dns_bytes, src, ctx, Transport::Doh).await {
         Ok((resp_buffer, _)) => {
@@ -119,13 +117,8 @@ async fn resolve_doh(
         }
         Err(e) => {
             warn!("DoH: resolve error for {}: {}", src, e);
-            let mut resp = DnsPacket::new();
-            resp.header.id = query_id;
-            resp.header.response = true;
-            resp.header.recursion_desired = query_rd;
-            resp.header.recursion_available = true;
-            resp.header.rescode = ResultCode::SERVFAIL;
-            resp.questions = questions;
+            let mut resp = DnsPacket::response_from(&query_for_error, ResultCode::SERVFAIL);
+            crate::ctx::shape_response_for_client(&mut resp, &query_for_error, ctx.filter_aaaa);
             serialize_response(&resp)
         }
     }
@@ -220,5 +213,29 @@ mod tests {
         pkt.header.rescode = ResultCode::FORMERR;
         let resp = serialize_response(&pkt);
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn doh_servfail_mirrors_client_opt() {
+        // RFC 6891 §6.1.1 on the Err-branch; empty-questions drives it.
+        let mut query = DnsPacket::new();
+        query.header.id = 0x1234;
+        query.header.recursion_desired = true;
+        query.edns = Some(crate::packet::EdnsOpt::default());
+        let mut buf = BytePacketBuffer::new();
+        query.write(&mut buf).unwrap();
+
+        let ctx = std::sync::Arc::new(crate::testutil::test_ctx().await);
+        let src: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let response = resolve_doh(buf.filled(), src, &ctx).await;
+
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let mut parse = BytePacketBuffer::from_bytes(&body);
+        let resp = DnsPacket::from_buffer(&mut parse).unwrap();
+
+        assert_eq!(resp.header.rescode, ResultCode::SERVFAIL);
+        assert!(resp.edns.is_some(), "DoH SERVFAIL must mirror client's OPT");
     }
 }

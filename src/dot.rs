@@ -165,7 +165,6 @@ async fn accept_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use rcgen::{CertificateParams, DnType, KeyPair};
@@ -234,20 +233,11 @@ mod tests {
         let upstream_addr = crate::testutil::blackhole_upstream();
 
         let mut ctx = crate::testutil::test_ctx().await;
-        ctx.zone_map = {
-            let mut m = HashMap::new();
-            let mut inner = HashMap::new();
-            inner.insert(
-                QueryType::A,
-                vec![DnsRecord::A {
-                    domain: "dot-test.example".to_string(),
-                    addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
-                    ttl: 300,
-                }],
-            );
-            m.insert("dot-test.example".to_string(), inner);
-            m
-        };
+        ctx.zone_map = crate::config::ZoneMap::from_exact(vec![DnsRecord::A {
+            domain: "dot-test.example".to_string(),
+            addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            ttl: 300,
+        }]);
         ctx.upstream_pool = Mutex::new(crate::forward::UpstreamPool::new(
             vec![crate::forward::Upstream::Udp(upstream_addr)],
             vec![],
@@ -424,20 +414,11 @@ mod tests {
         let upstream_addr = crate::testutil::blackhole_upstream();
 
         let mut ctx = crate::testutil::test_ctx().await;
-        ctx.zone_map = {
-            let mut m = HashMap::new();
-            let mut inner = HashMap::new();
-            inner.insert(
-                QueryType::A,
-                vec![DnsRecord::A {
-                    domain: "dot-test.example".to_string(),
-                    addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
-                    ttl: 300,
-                }],
-            );
-            m.insert("dot-test.example".to_string(), inner);
-            m
-        };
+        ctx.zone_map = crate::config::ZoneMap::from_exact(vec![DnsRecord::A {
+            domain: "dot-test.example".to_string(),
+            addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            ttl: 300,
+        }]);
         ctx.upstream_pool = Mutex::new(crate::forward::UpstreamPool::new(
             vec![crate::forward::Upstream::Udp(upstream_addr)],
             vec![],

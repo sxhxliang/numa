@@ -219,7 +219,7 @@ pub async fn run(config_path: String) -> crate::Result<()> {
         mitm: mitm_stores,
     });
 
-    let zone_count: usize = ctx.zone_map.values().map(|m| m.len()).sum();
+    let zone_count: usize = ctx.zone_map.len();
     let api_url = format!("http://localhost:{}", api_port);
     print_banner(
         &config,

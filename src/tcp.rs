@@ -166,7 +166,8 @@ pub(crate) async fn handle_framed_dns_connection<S>(
             }
             Err(e) => {
                 warn!("{} | RESOLVE ERROR | {}", remote_addr, e);
-                let resp = DnsPacket::response_from(&query, ResultCode::SERVFAIL);
+                let mut resp = DnsPacket::response_from(&query, ResultCode::SERVFAIL);
+                crate::ctx::shape_response_for_client(&mut resp, &query, ctx.filter_aaaa);
                 if send_response(&mut stream, &resp, remote_addr, proto)
                     .await
                     .is_err()
@@ -221,7 +222,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -237,20 +237,11 @@ mod tests {
         let upstream_addr = crate::testutil::blackhole_upstream();
 
         let mut ctx = crate::testutil::test_ctx().await;
-        ctx.zone_map = {
-            let mut m = HashMap::new();
-            let mut inner = HashMap::new();
-            inner.insert(
-                QueryType::A,
-                vec![DnsRecord::A {
-                    domain: "tcp-test.example".to_string(),
-                    addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
-                    ttl: 300,
-                }],
-            );
-            m.insert("tcp-test.example".to_string(), inner);
-            m
-        };
+        ctx.zone_map = crate::config::ZoneMap::from_exact(vec![DnsRecord::A {
+            domain: "tcp-test.example".to_string(),
+            addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            ttl: 300,
+        }]);
         ctx.upstream_pool = Mutex::new(crate::forward::UpstreamPool::new(
             vec![crate::forward::Upstream::Udp(upstream_addr)],
             vec![],
@@ -338,6 +329,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_servfail_mirrors_client_opt() {
+        // RFC 6891 §6.1.1 on the Err-branch; empty-questions drives it.
+        let addr = spawn_tcp_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        let mut query = DnsPacket::new();
+        query.header.id = 0xBEEF;
+        query.header.recursion_desired = true;
+        query.edns = Some(crate::packet::EdnsOpt::default());
+        let resp = tcp_exchange(&mut stream, &query).await;
+
+        assert_eq!(resp.header.rescode, ResultCode::SERVFAIL);
+        assert!(resp.edns.is_some(), "SERVFAIL must mirror client's OPT");
+    }
+
+    #[tokio::test]
     async fn tcp_oversize_message_closes_connection() {
         // A length prefix above MAX_MSG_LEN must drop the connection rather
         // than allocate and read the whole message.
@@ -381,20 +388,11 @@ mod tests {
         let upstream_addr = crate::testutil::blackhole_upstream();
 
         let mut ctx = crate::testutil::test_ctx().await;
-        ctx.zone_map = {
-            let mut m = HashMap::new();
-            let mut inner = HashMap::new();
-            inner.insert(
-                QueryType::A,
-                vec![DnsRecord::A {
-                    domain: "tcp-test.example".to_string(),
-                    addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
-                    ttl: 300,
-                }],
-            );
-            m.insert("tcp-test.example".to_string(), inner);
-            m
-        };
+        ctx.zone_map = crate::config::ZoneMap::from_exact(vec![DnsRecord::A {
+            domain: "tcp-test.example".to_string(),
+            addr: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            ttl: 300,
+        }]);
         ctx.upstream_pool = Mutex::new(crate::forward::UpstreamPool::new(
             vec![crate::forward::Upstream::Udp(upstream_addr)],
             vec![],

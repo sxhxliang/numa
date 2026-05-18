@@ -443,15 +443,11 @@ async fn diagnose(
         });
     }
 
-    // Check local zones
-    let zone_match = ctx
-        .zone_map
-        .get(domain_lower.as_str())
-        .and_then(|m| m.get(&qtype));
+    let zone_hit = ctx.zone_map.lookup(domain_lower.as_str(), qtype);
     steps.push(DiagnoseStep {
         source: "local_zone".to_string(),
-        matched: zone_match.is_some(),
-        detail: zone_match.map(|records| format!("{} records", records.len())),
+        matched: zone_hit.is_some(),
+        detail: zone_hit.map(|records| format!("{} records", records.len())),
     });
 
     // Check cache

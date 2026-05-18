@@ -5,6 +5,7 @@ const BUF_SIZE: usize = 4096;
 pub struct BytePacketBuffer {
     pub buf: [u8; BUF_SIZE],
     pub pos: usize,
+    overflow: bool,
 }
 
 impl Default for BytePacketBuffer {
@@ -18,6 +19,7 @@ impl BytePacketBuffer {
         BytePacketBuffer {
             buf: [0; BUF_SIZE],
             pos: 0,
+            overflow: false,
         }
     }
 
@@ -34,6 +36,11 @@ impl BytePacketBuffer {
 
     pub fn filled(&self) -> &[u8] {
         &self.buf[..self.pos]
+    }
+
+    /// True iff a `write*` errored because the buffer was full (#142).
+    pub fn overflowed(&self) -> bool {
+        self.overflow
     }
 
     pub fn step(&mut self, steps: usize) -> Result<()> {
@@ -115,6 +122,11 @@ impl BytePacketBuffer {
                 jumped = true;
                 jumps_performed += 1;
                 continue;
+            } else if (len & 0xC0) != 0 {
+                // RFC 1035 §4.1.4: 01/10 are reserved. Refuse rather than
+                // consume up to 191 bytes of garbage (e.g. a pointer landing
+                // mid-label, as observed against Tailscale MagicDNS, #142).
+                return Err(format!("Reserved label length bits: 0x{:02x}", len).into());
             } else {
                 pos += 1;
 
@@ -154,6 +166,7 @@ impl BytePacketBuffer {
 
     pub fn write(&mut self, val: u8) -> Result<()> {
         if self.pos >= BUF_SIZE {
+            self.overflow = true;
             return Err("End of buffer".into());
         }
         self.buf[self.pos] = val;
@@ -251,6 +264,7 @@ impl BytePacketBuffer {
     pub fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
         let end = self.pos + data.len();
         if end > BUF_SIZE {
+            self.overflow = true;
             return Err("End of buffer".into());
         }
         self.buf[self.pos..end].copy_from_slice(data);
@@ -427,5 +441,24 @@ mod tests {
         b.write_qname(".").unwrap();
         assert_eq!(&a.buf[..a.pos], b"\x00");
         assert_eq!(&b.buf[..b.pos], b"\x00");
+    }
+
+    #[test]
+    fn read_qname_rejects_reserved_label_high_bits() {
+        // RFC 1035 §4.1.4: 01/10 are reserved (only 00 = label, 11 = pointer).
+        let mut wire = vec![0x80];
+        wire.extend(std::iter::repeat_n(b'a', 128));
+        wire.push(0);
+        let mut buf = BytePacketBuffer::from_bytes(&wire);
+        assert!(buf.read_qname(&mut String::new()).is_err());
+    }
+
+    #[test]
+    fn read_qname_rejects_pointer_landing_mid_label() {
+        // [3]foo[0]<c0 02> — pointer jumps to offset 2 ('o' = 0x6f), whose
+        // reserved bits trip the guard. Observed against Tailscale MagicDNS (#142).
+        let mut buf = BytePacketBuffer::from_bytes(b"\x03foo\x00\xc0\x02");
+        buf.seek(5).unwrap();
+        assert!(buf.read_qname(&mut String::new()).is_err());
     }
 }

@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 use crate::blocklist::BlocklistStore;
 use crate::buffer::BytePacketBuffer;
 use crate::cache::DnsCache;
-use crate::config::UpstreamMode;
+use crate::config::{UpstreamMode, ZoneMap};
 use crate::ctx::ServerCtx;
 use crate::forward::{Upstream, UpstreamPool};
 use crate::header::ResultCode;
@@ -28,7 +28,7 @@ pub async fn test_ctx() -> ServerCtx {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     ServerCtx {
         socket,
-        zone_map: HashMap::new(),
+        zone_map: ZoneMap::default(),
         cache: RwLock::new(DnsCache::new(100, 60, 86400)),
         refreshing: Mutex::new(HashSet::new()),
         stats: Mutex::new(ServerStats::new()),
@@ -88,17 +88,22 @@ pub fn a_record_response(domain: &str, addr: Ipv4Addr, ttl: u32) -> DnsPacket {
 /// Spawn a UDP socket that replies to the first DNS query with the given
 /// response packet (patching the query ID to match). Returns the socket address.
 pub async fn mock_upstream(response: DnsPacket) -> SocketAddr {
+    let mut out = BytePacketBuffer::new();
+    response.write(&mut out).unwrap();
+    mock_upstream_raw(out.filled().to_vec()).await
+}
+
+/// Like `mock_upstream` but sends raw wire bytes — for intentionally
+/// malformed responses that can't survive our own serializer.
+pub async fn mock_upstream_raw(mut bytes: Vec<u8>) -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = [0u8; 512];
         let (_, src) = sock.recv_from(&mut buf).await.unwrap();
-        let query_id = u16::from_be_bytes([buf[0], buf[1]]);
-        let mut resp = response;
-        resp.header.id = query_id;
-        let mut out = BytePacketBuffer::new();
-        resp.write(&mut out).unwrap();
-        sock.send_to(out.filled(), src).await.unwrap();
+        bytes[0] = buf[0];
+        bytes[1] = buf[1];
+        sock.send_to(&bytes, src).await.unwrap();
     });
     addr
 }

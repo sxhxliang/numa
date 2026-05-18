@@ -370,11 +370,23 @@ domain = "1.0.168.192.in-addr.arpa"
 record_type = "PTR"
 value = "router.lan"
 ttl = 60
+
+# RFC 4592 wildcard — exercises the wire path only (owner=QNAME
+# synthesis, NODATA does not leak upstream). Apex shadowing,
+# trailing-dot normalization, and no-apex-match are covered by unit
+# tests in src/config.rs.
+[[zones]]
+domain = "*.foo.test"
+record_type = "A"
+value = "10.0.0.2"
+ttl = 60
 CONF
 
 RUST_LOG=info "$BINARY" "$CONFIG" > "$LOG" 2>&1 &
 NUMA_PID=$!
 sleep 3
+
+DIG="dig @127.0.0.1 -p $PORT +time=5 +tries=1"
 
 echo ""
 echo "=== Local Zones ==="
@@ -395,6 +407,35 @@ check "Local PTR record (192.168.0.1 → router.lan)" \
 check "Non-local domain still resolves" \
     "." \
     "$($DIG example.com A +short)"
+
+echo ""
+echo "=== Wildcard zones (RFC 4592) ==="
+
+# Owner is synthesized to QNAME on the wire (single descendant label).
+check "Wildcard owner = QNAME (x.foo.test A)" \
+    "10.0.0.2" \
+    "$($DIG x.foo.test A +short)"
+
+# Owner synthesis also works for multi-label descendants.
+check "Wildcard multi-label (deep.sub.foo.test A)" \
+    "10.0.0.2" \
+    "$($DIG deep.sub.foo.test A +short)"
+
+# Wildcard NODATA must not leak upstream (RFC 4592 §2.2.1).
+WILD_AAAA=$($DIG x.foo.test AAAA)
+check "Wildcard NODATA: status NOERROR" \
+    "status: NOERROR" \
+    "$WILD_AAAA"
+check "Wildcard NODATA: ANSWER: 0 (no upstream leak)" \
+    "ANSWER: 0" \
+    "$WILD_AAAA"
+
+# Exact-name NODATA also stays local (RFC 1034 §4.3.2 — PR #207
+# tightens this; previously fell through to upstream).
+EXACT_AAAA=$($DIG test.local AAAA)
+check "Exact NODATA: ANSWER: 0 (no upstream leak)" \
+    "ANSWER: 0" \
+    "$EXACT_AAAA"
 
 echo ""
 echo "=== DNS-over-TCP listener (RFC 1035 §4.2.2 / RFC 7766) ==="

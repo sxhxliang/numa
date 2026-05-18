@@ -222,6 +222,24 @@ impl DnsRecord {
         }
     }
 
+    pub(crate) fn set_domain(&mut self, new_domain: String) {
+        match self {
+            DnsRecord::A { domain, .. }
+            | DnsRecord::NS { domain, .. }
+            | DnsRecord::CNAME { domain, .. }
+            | DnsRecord::PTR { domain, .. }
+            | DnsRecord::MX { domain, .. }
+            | DnsRecord::AAAA { domain, .. }
+            | DnsRecord::DNSKEY { domain, .. }
+            | DnsRecord::DS { domain, .. }
+            | DnsRecord::RRSIG { domain, .. }
+            | DnsRecord::NSEC { domain, .. }
+            | DnsRecord::NSEC3 { domain, .. }
+            | DnsRecord::SOA { domain, .. }
+            | DnsRecord::UNKNOWN { domain, .. } => *domain = new_domain,
+        }
+    }
+
     pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsRecord> {
         let mut domain = String::with_capacity(64);
         buffer.read_qname(&mut domain)?;
